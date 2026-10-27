@@ -60,7 +60,8 @@ func detectAvatarType(b []byte) string {
 // avatarSide×avatarSide. Only the re-encoded pixels are kept, so EXIF (GPS
 // position, device, capture time) and every other piece of metadata or
 // trailing data is dropped, and what is served is always a well-formed
-// image. JPEG stays JPEG (quality 85); PNG and WebP become PNG.
+// image. A JPEG's EXIF Orientation is applied to the pixels first, so phone
+// photos stay upright. JPEG stays JPEG (quality 85); PNG and WebP become PNG.
 func processAvatar(data []byte) (out []byte, contentType string, code avatarError) {
 	format := detectAvatarType(data)
 	if format == "" {
@@ -85,6 +86,11 @@ func processAvatar(data []byte) (out []byte, contentType string, code avatarErro
 		draw.Draw(dst, dst.Bounds(), src, b.Min, draw.Src)
 	} else {
 		draw.CatmullRom.Scale(dst, dst.Bounds(), src, b, draw.Src, nil)
+	}
+	if format == "jpeg" {
+		// The EXIF Orientation is lost with the rest of EXIF, so turn the
+		// pixels upright now. (The box is square, so scaling first is fine.)
+		dst = applyOrientation(dst, jpegOrientation(data))
 	}
 
 	var buf bytes.Buffer
