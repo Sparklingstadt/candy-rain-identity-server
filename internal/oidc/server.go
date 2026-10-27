@@ -47,6 +47,7 @@ type Options struct {
 	Issuer        string
 	Clients       []config.Client
 	Users         user.Store
+	Avatars       user.AvatarStore // required
 	Signer        *Signer
 	SessionSecret []byte
 	LoginHint     string
@@ -71,6 +72,9 @@ func New(opts Options) *Server {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
+	if opts.Avatars == nil {
+		panic("oidc: Options.Avatars is required")
+	}
 	s := &Server{
 		opts:          opts,
 		clients:       make(map[string]config.Client, len(opts.Clients)),
@@ -90,6 +94,10 @@ func New(opts Options) *Server {
 	mux.HandleFunc("GET /userinfo", s.handleUserinfo)
 	mux.HandleFunc("POST /userinfo", s.handleUserinfo)
 	mux.HandleFunc("GET /logout", s.handleLogout)
+	mux.HandleFunc("GET /avatars/{sub}", s.handleAvatar)
+	mux.HandleFunc("GET /account", s.handleAccount)
+	mux.HandleFunc("POST /account/avatar", s.handleAvatarUpload)
+	mux.HandleFunc("POST /account/avatar/delete", s.handleAvatarDelete)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
 	s.handler = securityHeaders(mux)
 	return s
@@ -128,7 +136,7 @@ func (s *Server) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
 		"scopes_supported":                               []string{"openid", "email", "profile"},
 		"token_endpoint_auth_methods_supported":          []string{"client_secret_basic", "client_secret_post"},
 		"code_challenge_methods_supported":               []string{"S256"},
-		"claims_supported":                               []string{"sub", "email", "name", "given_name", "family_name", "role", "auth_time", "nonce"},
+		"claims_supported":                               []string{"sub", "email", "name", "given_name", "family_name", "picture", "role", "auth_time", "nonce"},
 		"authorization_response_iss_parameter_supported": true,
 	})
 }
@@ -205,7 +213,20 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		s.redirectError(w, r, a, "login_required", "the user is not signed in")
 		return
 	}
-	s.renderLogin(w, r, http.StatusOK, a, "", "")
+	s.renderLogin(w, r, http.StatusOK, loginForm{Request: a}, "", "")
+}
+
+// nextAccount is the only place a standalone sign-in (one without an OIDC
+// client) can continue to. The form carries this fixed token, never a URL,
+// and the handler maps it to the fixed path /account, so the login form
+// cannot be turned into an open redirector.
+const nextAccount = "account"
+
+// loginForm says where the login form continues: to a client through the
+// authorization request, or to the account page.
+type loginForm struct {
+	Request authRequest
+	Account bool
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -214,13 +235,23 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		s.renderError(w, http.StatusBadRequest, "送信内容を読み取れませんでした。")
 		return
 	}
-	a := parseAuthRequest(r.PostForm)
-	if !s.validate(w, r, a) {
-		return
+	// Only the exact token selects the account page. Any other value of next
+	// is ignored and the form is treated as an authorization request, which
+	// validate rejects unless client_id and redirect_uri are registered.
+	form := loginForm{Account: r.PostForm.Get("next") == nextAccount}
+	if !form.Account {
+		form.Request = parseAuthRequest(r.PostForm)
+		if !s.validate(w, r, form.Request) {
+			return
+		}
 	}
 	cookie, err := r.Cookie(csrfName)
 	if err != nil || subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(r.PostForm.Get("csrf_token"))) != 1 {
-		s.renderError(w, http.StatusBadRequest, "画面の有効期限が切れました。ストアからもう一度サインインしてください。")
+		msg := "画面の有効期限が切れました。ストアからもう一度サインインしてください。"
+		if form.Account {
+			msg = "画面の有効期限が切れました。アカウント画面を開き直してください。"
+		}
+		s.renderError(w, http.StatusBadRequest, msg)
 		return
 	}
 
@@ -229,7 +260,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	u, err := s.authenticate(r.Context(), email, password)
 	if errors.Is(err, errBadCredentials) {
 		s.opts.Logger.Info("sign-in failed", "email", email)
-		s.renderLogin(w, r, http.StatusUnauthorized, a, email, "メールアドレスまたはパスワードが違います。")
+		s.renderLogin(w, r, http.StatusUnauthorized, form, email, "メールアドレスまたはパスワードが違います。")
 		return
 	}
 	if err != nil {
@@ -243,7 +274,11 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		UserID: u.ID, AuthTime: now, ExpiresAt: now.Add(sessionTTL),
 	}), "/", int(sessionTTL.Seconds())))
 	s.opts.Logger.Info("signed in", "sub", u.Subject())
-	s.issueCode(w, r, a, u.ID, now)
+	if form.Account {
+		http.Redirect(w, r, "/account", http.StatusSeeOther)
+		return
+	}
+	s.issueCode(w, r, form.Request, u.ID, now)
 }
 
 var errBadCredentials = errors.New("bad credentials")
@@ -353,7 +388,7 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 	}
 
 	exp := now.Add(tokenTTL)
-	idClaims := userClaims(u, c.Scope)
+	idClaims := s.userClaims(r.Context(), u, c.Scope)
 	idClaims["iss"] = s.opts.Issuer
 	idClaims["aud"] = c.ClientID
 	idClaims["iat"] = now.Unix()
@@ -424,7 +459,7 @@ func verifyPKCE(verifier, challenge string) bool {
 
 // userClaims returns the claims allowed by the granted scopes. role is
 // always included because the store decides admin access from it.
-func userClaims(u user.User, scope string) map[string]any {
+func (s *Server) userClaims(ctx context.Context, u user.User, scope string) map[string]any {
 	scopes := strings.Fields(scope)
 	claims := map[string]any{"sub": u.Subject(), "role": u.Role}
 	if slices.Contains(scopes, "email") {
@@ -434,6 +469,9 @@ func userClaims(u user.User, scope string) map[string]any {
 		claims["name"] = u.DisplayName()
 		claims["given_name"] = u.FirstName
 		claims["family_name"] = u.LastName
+		if picture := s.pictureURL(ctx, u); picture != "" {
+			claims["picture"] = picture
+		}
 	}
 	return claims
 }
@@ -466,7 +504,7 @@ func (s *Server) handleUserinfo(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
-	writeJSON(w, http.StatusOK, userClaims(u, scope))
+	writeJSON(w, http.StatusOK, s.userClaims(r.Context(), u, scope))
 }
 
 // ---- logout ----
@@ -517,7 +555,7 @@ func (s *Server) cookie(name, value, path string, maxAge int) *http.Cookie {
 	}
 }
 
-func (s *Server) renderLogin(w http.ResponseWriter, r *http.Request, status int, a authRequest, email, errMsg string) {
+func (s *Server) renderLogin(w http.ResponseWriter, r *http.Request, status int, form loginForm, email, errMsg string) {
 	csrf := randomToken()
 	if c, err := r.Cookie(csrfName); err == nil && len(c.Value) >= 32 {
 		csrf = c.Value
@@ -525,7 +563,8 @@ func (s *Server) renderLogin(w http.ResponseWriter, r *http.Request, status int,
 	http.SetCookie(w, s.cookie(csrfName, csrf, "/authorize", 3600))
 	w.Header().Set("Cache-Control", "no-store")
 	s.render(w, status, "login.html", map[string]any{
-		"Request":   a,
+		"Request":   form.Request,
+		"Account":   form.Account,
 		"CSRF":      csrf,
 		"Email":     email,
 		"Error":     errMsg,

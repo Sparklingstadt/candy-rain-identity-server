@@ -57,10 +57,11 @@ func (f fakeStore) FindByID(_ context.Context, id int64) (user.User, error) {
 }
 
 type harness struct {
-	t      *testing.T
-	ts     *httptest.Server
-	client *http.Client
-	signer *Signer
+	t       *testing.T
+	ts      *httptest.Server
+	client  *http.Client
+	signer  *Signer
+	avatars *user.MemoryAvatarStore
 }
 
 func newHarness(t *testing.T) *harness {
@@ -74,7 +75,7 @@ func newHarness(t *testing.T) *harness {
 		{ID: 1, Email: "user1@mail.com", PasswordHash: string(hash), FirstName: "花子", LastName: "雨宮", Role: "CUSTOMER"},
 	}}
 	signer := NewSigner(key)
-	h := &harness{t: t, signer: signer}
+	h := &harness{t: t, signer: signer, avatars: user.NewMemoryAvatarStore()}
 	h.ts = httptest.NewUnstartedServer(nil)
 	issuer := "http://" + h.ts.Listener.Addr().String()
 	h.ts.Config.Handler = New(Options{
@@ -87,6 +88,7 @@ func newHarness(t *testing.T) *harness {
 			RedirectURIs: []string{storesRedirectURI}, PostLogoutRedirectURIs: []string{storesLogoutURI},
 		}},
 		Users:         store,
+		Avatars:       h.avatars,
 		Signer:        signer,
 		SessionSecret: []byte(strings.Repeat("s", 32)),
 	})

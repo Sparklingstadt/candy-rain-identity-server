@@ -1,0 +1,28 @@
+{{define "account.html"}}{{template "head" "アカウント"}}
+<h1>アカウント</h1>
+{{with .Notice}}<p class="notice" role="status">{{.}}</p>{{end}}
+{{with .Error}}<p class="error" role="alert">{{.}}</p>{{end}}
+<div class="profile">
+  {{if .Avatar}}<img class="avatar" src="{{.Avatar}}" alt="プロフィール画像" width="88" height="88">{{else}}<div class="avatar" role="img" aria-label="プロフィール画像は未登録です"></div>{{end}}
+  <div>
+    <p class="name">{{.Name}}</p>
+    <p class="email">{{.Email}}</p>
+  </div>
+</div>
+
+<h2>プロフィール画像</h2>
+<form method="post" action="/account/avatar" enctype="multipart/form-data">
+  <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+  <label for="avatar">画像ファイル</label>
+  <input id="avatar" name="avatar" type="file" accept="image/png,image/jpeg,image/webp" required>
+  <p class="hint">PNG・JPEG・WebP、1MB 以下。登録した画像は Candy Rain ID でサインインするサービスに表示されます。</p>
+  <button type="submit">アップロード</button>
+</form>
+{{if .Avatar}}
+<form method="post" action="/account/avatar/delete">
+  <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+  <button type="submit" class="secondary">画像を削除</button>
+</form>
+{{end}}
+<p class="links"><a href="/logout">サインアウト</a></p>
+{{template "foot"}}{{end}}
