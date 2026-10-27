@@ -1,0 +1,4 @@
+/identity-server
+/bin/
+.env
+*.pem

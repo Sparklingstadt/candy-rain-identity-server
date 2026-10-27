@@ -1,0 +1,170 @@
+From 33114c2fde849331c45f9f2ea7c11687ab16642b Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 07:35:49 +0000
+Subject: [PATCH] =?UTF-8?q?feat:=20Candy=20Rain=20ID=EF=BC=88OpenID=20Conn?=
+ =?UTF-8?q?ect=EF=BC=89=E3=81=A7=E3=82=B5=E3=82=A4=E3=83=B3=E3=82=A4?=
+ =?UTF-8?q?=E3=83=B3=E3=81=A7=E3=81=8D=E3=82=8B=E3=82=88=E3=81=86=E3=81=AB?=
+ =?UTF-8?q?=E3=81=99=E3=82=8B?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QKzq5QykJLBr6vX9gsfdrN
+---
+ .env.example                              |  6 +++++
+ app/(routes)/account/SignOut.tsx          |  2 +-
+ app/(routes)/signin/CandyRainIdSignIn.tsx | 15 ++++++++++++
+ app/(routes)/signin/page.tsx              |  8 +++++++
+ app/api/signout-redirect/route.ts         | 14 ++++++++++++
+ auth.ts                                   | 28 ++++++++++++++++++++---
+ 6 files changed, 69 insertions(+), 4 deletions(-)
+ create mode 100644 app/(routes)/signin/CandyRainIdSignIn.tsx
+ create mode 100644 app/api/signout-redirect/route.ts
+
+diff --git a/.env.example b/.env.example
+index f5fa194..bb564dd 100644
+--- a/.env.example
++++ b/.env.example
+@@ -5,3 +5,9 @@ AUTH_SECRET="replace-with-a-random-secret"
+ # Leave empty to place orders without payment. Live keys are rejected.
+ STRIPE_SECRET_KEY=""
+ NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY=""
++# Optional: Candy Rain ID (candy-rain-identity-server). Set all three to show
++# "Candy Rain ID でサインイン". Register <store origin>/api/auth/callback/candy-rain-id
++# as the redirect URI and <store origin>/signout as the post-logout redirect URI there.
++AUTH_CANDY_RAIN_ID_ISSUER=""
++AUTH_CANDY_RAIN_ID_ID=""
++AUTH_CANDY_RAIN_ID_SECRET=""
+diff --git a/app/(routes)/account/SignOut.tsx b/app/(routes)/account/SignOut.tsx
+index 7692681..f6e3ff1 100644
+--- a/app/(routes)/account/SignOut.tsx
++++ b/app/(routes)/account/SignOut.tsx
+@@ -10,7 +10,7 @@ export default function SignOut({ compact = false }: { compact?: boolean }) {
+   const handleSignOut = async () => {
+     setIsPending(true)
+     try {
+-      await signOut({ redirectTo: "/signout" })
++      await signOut({ redirectTo: "/api/signout-redirect" })
+     } finally {
+       setIsPending(false)
+     }
+diff --git a/app/(routes)/signin/CandyRainIdSignIn.tsx b/app/(routes)/signin/CandyRainIdSignIn.tsx
+new file mode 100644
+index 0000000..f51060a
+--- /dev/null
++++ b/app/(routes)/signin/CandyRainIdSignIn.tsx
+@@ -0,0 +1,15 @@
++import { signIn } from "@/auth"
++import { Button } from "@/components/ui/button"
++
++export function CandyRainIdSignIn({ providerId }: { providerId: string }) {
++  const handleSignIn = async () => {
++    "use server"
++    await signIn(providerId, { redirectTo: "/products" })
++  }
++
++  return (
++    <form action={handleSignIn}>
++      <Button type="submit" variant="outline" className="w-full">Candy Rain ID でサインイン</Button>
++    </form>
++  )
++}
+diff --git a/app/(routes)/signin/page.tsx b/app/(routes)/signin/page.tsx
+index acf4f1a..1372df7 100644
+--- a/app/(routes)/signin/page.tsx
++++ b/app/(routes)/signin/page.tsx
+@@ -1,5 +1,7 @@
+ import type { Metadata } from "next"
+ import { SignInForm } from "@/app/(routes)/signin/SignInForm"
++import { CandyRainIdSignIn } from "@/app/(routes)/signin/CandyRainIdSignIn"
++import { candyRainIdIssuer, candyRainIdProviderId } from "@/auth"
+ import CandyPill from "@/app/components/CandyPill"
+ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+ 
+@@ -21,6 +23,12 @@ export default async function Page({ searchParams }: { searchParams: Promise<{ e
+             メールアドレスまたはパスワードが正しくありません。
+           </p>
+         )}
++        {candyRainIdIssuer && (
++          <>
++            <CandyRainIdSignIn providerId={candyRainIdProviderId} />
++            <div className="flex items-center gap-3 text-xs text-muted-foreground"><span className="h-px flex-1 bg-border" />または<span className="h-px flex-1 bg-border" /></div>
++          </>
++        )}
+         <SignInForm />
+         <div className="bg-muted p-4 text-sm">
+           <p className="font-medium">入力例</p>
+diff --git a/app/api/signout-redirect/route.ts b/app/api/signout-redirect/route.ts
+new file mode 100644
+index 0000000..207fd7b
+--- /dev/null
++++ b/app/api/signout-redirect/route.ts
+@@ -0,0 +1,14 @@
++import { candyRainIdIssuer } from "@/auth"
++
++// After the store session is cleared, also end the Candy Rain ID session;
++// otherwise the next "Candy Rain ID でサインイン" would sign in again without a password.
++// The identity server sends the browser back to /signout.
++export function GET(request: Request) {
++  const signoutUrl = new URL("/signout", request.url)
++  if (!candyRainIdIssuer) return Response.redirect(signoutUrl, 303)
++
++  const logoutUrl = new URL(`${candyRainIdIssuer}/logout`)
++  logoutUrl.searchParams.set("post_logout_redirect_uri", signoutUrl.toString())
++  if (process.env.AUTH_CANDY_RAIN_ID_ID) logoutUrl.searchParams.set("client_id", process.env.AUTH_CANDY_RAIN_ID_ID)
++  return Response.redirect(logoutUrl, 303)
++}
+diff --git a/auth.ts b/auth.ts
+index c5c4ccd..ec82d04 100644
+--- a/auth.ts
++++ b/auth.ts
+@@ -2,9 +2,29 @@ import NextAuth from "next-auth";
+ import Credentials from "next-auth/providers/credentials";
+ import { compare } from "bcryptjs";
+ import { prisma } from "@/lib/prisma";
++import { roles, type Role } from "@/lib/roles";
++
++// Candy Rain ID (candy-rain-identity-server) is an OpenID Connect provider.
++// It is enabled only when its issuer is configured, so local development and
++// CI keep working with the demo credentials alone.
++export const candyRainIdIssuer = process.env.AUTH_CANDY_RAIN_ID_ISSUER?.replace(/\/$/, "")
++export const candyRainIdProviderId = "candy-rain-id"
+ 
+ export const { handlers, signIn, signOut, auth } = NextAuth({
+   providers: [
++    ...(candyRainIdIssuer ? [{
++      id: candyRainIdProviderId,
++      name: "Candy Rain ID",
++      type: "oidc" as const,
++      issuer: candyRainIdIssuer,
++      clientId: process.env.AUTH_CANDY_RAIN_ID_ID,
++      clientSecret: process.env.AUTH_CANDY_RAIN_ID_SECRET,
++      authorization: { params: { scope: "openid email profile" } },
++      profile(profile: { sub: string, email?: string, name?: string, role?: string }) {
++        const role = roles.find((r) => r === profile.role)
++        return { id: profile.sub, email: profile.email, name: profile.name, role }
++      },
++    }] : []),
+     Credentials({
+       credentials: {
+         email: {
+@@ -34,10 +54,12 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
+     async authorized({ auth }) {
+       return !!auth
+     },
+-    jwt({ token, user }) {
++    jwt({ token, user, account }) {
+       if (user) { // User is available during sign-in
+-        token.id = user.id
+-        token.role = user.role
++        // Auth.js replaces user.id with a random UUID for OAuth/OIDC sign-ins;
++        // the identity server's subject (the store's User.id) is kept on the account.
++        token.id = account?.provider === candyRainIdProviderId ? account.providerAccountId : user.id
++        token.role = user.role as Role | undefined
+       }
+       return token
+     },
+-- 
+2.43.0
+

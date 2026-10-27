@@ -1,0 +1,23 @@
+{{define "login.html"}}{{template "head" "サインイン"}}
+<h1>サインイン</h1>
+{{with .Error}}<p class="error" role="alert">{{.}}</p>{{end}}
+<form method="post" action="/authorize">
+  <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+  {{with .Request}}
+  <input type="hidden" name="response_type" value="{{.ResponseType}}">
+  <input type="hidden" name="client_id" value="{{.ClientID}}">
+  <input type="hidden" name="redirect_uri" value="{{.RedirectURI}}">
+  <input type="hidden" name="scope" value="{{.Scope}}">
+  <input type="hidden" name="state" value="{{.State}}">
+  <input type="hidden" name="nonce" value="{{.Nonce}}">
+  <input type="hidden" name="code_challenge" value="{{.CodeChallenge}}">
+  <input type="hidden" name="code_challenge_method" value="{{.CodeChallengeMethod}}">
+  {{end}}
+  <label for="email">メールアドレス</label>
+  <input id="email" name="email" type="email" autocomplete="email" value="{{.Email}}" required autofocus>
+  <label for="password">パスワード</label>
+  <input id="password" name="password" type="password" autocomplete="current-password" required>
+  <button type="submit">サインイン</button>
+</form>
+{{with .LoginHint}}<p class="hint">{{.}}</p>{{end}}
+{{template "foot"}}{{end}}

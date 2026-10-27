@@ -1,0 +1,38 @@
+{{define "head"}}<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>{{.}} | Candy Rain ID</title>
+<style>
+  :root { color-scheme: light; --pink: #e85d8f; --pink-dark: #c9406f; --ink: #3b2a33; --muted: #8a7480; --line: #f1d6e1; }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 24px 16px;
+         font-family: system-ui, -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; color: var(--ink);
+         background: linear-gradient(160deg, #fff5f9 0%, #fde8f0 55%, #eaf4ff 100%); }
+  main { width: 100%; max-width: 400px; background: #fff; border: 1px solid var(--line); border-radius: 20px; padding: 32px 28px;
+         box-shadow: 0 12px 40px rgba(232, 93, 143, .12); }
+  .brand { margin: 0 0 4px; font-size: 13px; letter-spacing: .12em; color: var(--pink); font-weight: 700; }
+  h1 { margin: 0 0 24px; font-size: 22px; }
+  label { display: block; font-size: 14px; font-weight: 600; margin: 16px 0 6px; }
+  input[type=email], input[type=password] { width: 100%; padding: 11px 12px; font-size: 16px; border: 1px solid #dcc7d0; border-radius: 10px; }
+  input:focus { outline: 2px solid var(--pink); outline-offset: 1px; border-color: transparent; }
+  button { width: 100%; margin-top: 24px; padding: 12px; font-size: 16px; font-weight: 700; color: #fff; background: var(--pink);
+           border: 0; border-radius: 999px; cursor: pointer; }
+  button:hover { background: var(--pink-dark); }
+  .error { margin: 0 0 8px; padding: 10px 12px; border-radius: 10px; background: #fff0f3; color: #b4234f; font-size: 14px; }
+  .hint, p.message { color: var(--muted); font-size: 13px; line-height: 1.7; }
+  p.message { font-size: 15px; color: var(--ink); }
+</style>
+</head>
+<body>
+<main>
+<p class="brand">CANDY RAIN ID</p>
+{{end}}
+
+{{define "foot"}}
+</main>
+</body>
+</html>
+{{end}}
