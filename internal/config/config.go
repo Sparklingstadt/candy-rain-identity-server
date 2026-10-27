@@ -31,6 +31,10 @@ type Config struct {
 	Clients       []Client
 	// LoginHint is shown under the login form, e.g. the demo account.
 	LoginHint string
+	// ClientIPHeader is the header with the client's IP, set by the proxy
+	// in front. Vercel overwrites X-Real-IP, so it is the default there.
+	// Elsewhere it is empty (the TCP peer) unless CLIENT_IP_HEADER is set.
+	ClientIPHeader string
 }
 
 // Load reads the environment. Missing secrets are generated for local
@@ -58,6 +62,8 @@ func Load(logger *slog.Logger) (Config, error) {
 		errs = append(errs, err)
 	}
 	cfg.Clients = clients
+
+	cfg.ClientIPHeader = clientIPHeader()
 
 	// On Vercel every instance would generate its own key and secret, so
 	// tokens, codes and sessions issued by one would fail on another.
@@ -166,6 +172,18 @@ func ParseRSAPrivateKey(data []byte) (*rsa.PrivateKey, error) {
 		return nil, errors.New("key is not RSA")
 	}
 	return key, nil
+}
+
+// clientIPHeader returns CLIENT_IP_HEADER, or X-Real-IP on Vercel, which
+// overwrites that header with the client's address so it cannot be spoofed.
+func clientIPHeader() string {
+	if h := os.Getenv("CLIENT_IP_HEADER"); h != "" {
+		return h
+	}
+	if os.Getenv("VERCEL") != "" {
+		return "X-Real-IP"
+	}
+	return ""
 }
 
 func envOr(name, fallback string) string {

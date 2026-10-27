@@ -35,5 +35,5 @@ CREATE TABLE IF NOT EXISTS idp.user_avatar (
 );
 
 -- Supabase の Data API から読み書きされないよう RLS を有効にし、ポリシーは作らない。
--- ID サーバーはテーブル所有者のロールで接続するので RLS の影響を受けない。
+-- ID サーバーは専用ロール idp_server で接続し、003_idp_server_role.sql で作るポリシーで読み書きする。
 ALTER TABLE idp.user_avatar ENABLE ROW LEVEL SECURITY;

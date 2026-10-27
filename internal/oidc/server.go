@@ -24,6 +24,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/Sparklingstadt/candy-rain-identity-server/internal/config"
+	"github.com/Sparklingstadt/candy-rain-identity-server/internal/loginlimit"
 	"github.com/Sparklingstadt/candy-rain-identity-server/internal/user"
 )
 
@@ -61,6 +62,18 @@ type Options struct {
 	SessionSecret []byte
 	LoginHint     string
 	Logger        *slog.Logger
+
+	// LoginFailures counts failed sign-ins; required.
+	LoginFailures loginlimit.Store
+	// ClientIPHeader names the request header that carries the client's IP,
+	// set by a proxy that overwrites it (X-Real-IP on Vercel). Empty means
+	// the TCP peer address is used.
+	ClientIPHeader string
+	// MaxEmailFailures and MaxIPFailures override the sign-in limits
+	// (maxEmailFailures, maxIPFailures) when set; tests lower them.
+	MaxEmailFailures int
+	MaxIPFailures    int
+
 	// Now is overridable in tests.
 	Now func() time.Time
 }
@@ -84,6 +97,15 @@ func New(opts Options) *Server {
 	}
 	if opts.Avatars == nil {
 		panic("oidc: Options.Avatars is required")
+	}
+	if opts.LoginFailures == nil {
+		panic("oidc: Options.LoginFailures is required")
+	}
+	if opts.MaxEmailFailures <= 0 {
+		opts.MaxEmailFailures = maxEmailFailures
+	}
+	if opts.MaxIPFailures <= 0 {
+		opts.MaxIPFailures = maxIPFailures
 	}
 	s := &Server{
 		opts:          opts,
@@ -288,9 +310,15 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	email := strings.TrimSpace(r.PostForm.Get("email"))
 	password := r.PostForm.Get("password")
+	keys := s.loginKeys(r, email)
+	if s.loginBlocked(r.Context(), keys) {
+		s.renderLogin(w, r, http.StatusTooManyRequests, form, email, "サインインの試行回数が多すぎます。しばらく時間をおいてからもう一度お試しください。")
+		return
+	}
 	u, err := s.authenticate(r.Context(), email, password)
 	if errors.Is(err, errBadCredentials) {
 		s.opts.Logger.Info("sign-in failed", "email", email)
+		s.recordLoginFailure(r.Context(), keys)
 		s.renderLogin(w, r, http.StatusUnauthorized, form, email, "メールアドレスまたはパスワードが違います。")
 		return
 	}
@@ -300,6 +328,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.resetLoginFailures(r.Context(), keys)
 	now := s.opts.Now()
 	http.SetCookie(w, s.cookie(sessionName, s.sessions.Encode(session{
 		UserID: u.ID, AuthTime: now, ExpiresAt: now.Add(sessionTTL),

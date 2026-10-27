@@ -21,6 +21,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/Sparklingstadt/candy-rain-identity-server/internal/config"
+	"github.com/Sparklingstadt/candy-rain-identity-server/internal/loginlimit"
 	"github.com/Sparklingstadt/candy-rain-identity-server/internal/user"
 )
 
@@ -82,13 +83,14 @@ func (f *fakeStore) setPassword(t *testing.T, id int64, plain string) {
 }
 
 type harness struct {
-	t       *testing.T
-	ts      *httptest.Server
-	client  *http.Client
-	signer  *Signer
-	avatars *user.MemoryAvatarStore
-	store   *fakeStore
-	srv     *Server
+	t        *testing.T
+	ts       *httptest.Server
+	client   *http.Client
+	signer   *Signer
+	avatars  *user.MemoryAvatarStore
+	store    *fakeStore
+	failures *loginlimit.MemoryStore
+	srv      *Server
 }
 
 func newHarness(t *testing.T) *harness {
@@ -100,7 +102,8 @@ func newHarness(t *testing.T) *harness {
 }
 
 // newHarnessWith runs the server on any avatar store, e.g. a failing one.
-func newHarnessWith(t *testing.T, avatars user.AvatarStore) *harness {
+// configure, if given, adjusts the options before the server is created.
+func newHarnessWith(t *testing.T, avatars user.AvatarStore, configure ...func(*Options)) *harness {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -112,10 +115,10 @@ func newHarnessWith(t *testing.T, avatars user.AvatarStore) *harness {
 		{ID: 2, Email: "user2@mail.com", PasswordHash: string(hash), FirstName: "太郎", LastName: "晴山", Role: "CUSTOMER"},
 	}}
 	signer := NewSigner(key)
-	h := &harness{t: t, signer: signer, store: store}
+	h := &harness{t: t, signer: signer, store: store, failures: loginlimit.NewMemoryStore()}
 	h.ts = httptest.NewUnstartedServer(nil)
 	issuer := "http://" + h.ts.Listener.Addr().String()
-	h.srv = New(Options{
+	opts := Options{
 		Issuer: issuer,
 		Clients: []config.Client{{
 			ID: clientID, Secret: clientSecret,
@@ -126,9 +129,14 @@ func newHarnessWith(t *testing.T, avatars user.AvatarStore) *harness {
 		}},
 		Users:         store,
 		Avatars:       avatars,
+		LoginFailures: h.failures,
 		Signer:        signer,
 		SessionSecret: []byte(strings.Repeat("s", 32)),
-	})
+	}
+	for _, f := range configure {
+		f(&opts)
+	}
+	h.srv = New(opts)
 	h.ts.Config.Handler = h.srv
 	h.ts.Start()
 	t.Cleanup(h.ts.Close)
