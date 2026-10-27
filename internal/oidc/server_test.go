@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
@@ -13,6 +14,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -36,9 +38,14 @@ const (
 	storesLogoutURI    = "http://stores.test/"
 )
 
-type fakeStore struct{ users []user.User }
+type fakeStore struct {
+	mu    sync.Mutex
+	users []user.User
+}
 
-func (f fakeStore) FindByEmail(_ context.Context, email string) (user.User, error) {
+func (f *fakeStore) FindByEmail(_ context.Context, email string) (user.User, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	for _, u := range f.users {
 		if u.Email == email {
 			return u, nil
@@ -47,7 +54,9 @@ func (f fakeStore) FindByEmail(_ context.Context, email string) (user.User, erro
 	return user.User{}, user.ErrNotFound
 }
 
-func (f fakeStore) FindByID(_ context.Context, id int64) (user.User, error) {
+func (f *fakeStore) FindByID(_ context.Context, id int64) (user.User, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	for _, u := range f.users {
 		if u.ID == id {
 			return u, nil
@@ -56,12 +65,29 @@ func (f fakeStore) FindByID(_ context.Context, id int64) (user.User, error) {
 	return user.User{}, user.ErrNotFound
 }
 
+// setPassword changes a user's password, as candy-rain-store would.
+func (f *fakeStore) setPassword(t *testing.T, id int64, plain string) {
+	t.Helper()
+	hash, err := bcrypt.GenerateFromPassword([]byte(plain), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.users {
+		if f.users[i].ID == id {
+			f.users[i].PasswordHash = string(hash)
+		}
+	}
+}
+
 type harness struct {
 	t       *testing.T
 	ts      *httptest.Server
 	client  *http.Client
 	signer  *Signer
 	avatars *user.MemoryAvatarStore
+	store   *fakeStore
 	srv     *Server
 }
 
@@ -81,12 +107,12 @@ func newHarnessWith(t *testing.T, avatars user.AvatarStore) *harness {
 		t.Fatal(err)
 	}
 	hash, _ := bcrypt.GenerateFromPassword([]byte(password), bcrypt.MinCost)
-	store := fakeStore{users: []user.User{
+	store := &fakeStore{users: []user.User{
 		{ID: 1, Email: "user1@mail.com", PasswordHash: string(hash), FirstName: "花子", LastName: "雨宮", Role: "CUSTOMER"},
 		{ID: 2, Email: "user2@mail.com", PasswordHash: string(hash), FirstName: "太郎", LastName: "晴山", Role: "CUSTOMER"},
 	}}
 	signer := NewSigner(key)
-	h := &harness{t: t, signer: signer}
+	h := &harness{t: t, signer: signer, store: store}
 	h.ts = httptest.NewUnstartedServer(nil)
 	issuer := "http://" + h.ts.Listener.Addr().String()
 	h.srv = New(Options{
@@ -502,5 +528,72 @@ func TestLogoutRedirectIsCheckedAgainstTheNamedClient(t *testing.T) {
 		if followed != tc.follow {
 			t.Errorf("client_id=%q target=%s: status %d location %q", tc.clientID, tc.target, res.StatusCode, res.Header.Get("Location"))
 		}
+	}
+}
+
+func TestDummyHashCostsAsMuchAsAStorePassword(t *testing.T) {
+	cost, err := bcrypt.Cost(dummyHash)
+	if err != nil {
+		t.Fatalf("dummyHash is not a bcrypt hash: %v", err)
+	}
+	if cost != storeBcryptCost {
+		t.Fatalf("dummyHash cost %d, candy-rain-store uses %d", cost, storeBcryptCost)
+	}
+	h := newHarness(t)
+	if _, err := h.srv.authenticate(context.Background(), "nobody@mail.com", password); !errors.Is(err, errBadCredentials) {
+		t.Fatalf("unknown email: %v", err)
+	}
+}
+
+func TestPasswordChangeEndsTheSession(t *testing.T) {
+	h := newHarness(t)
+	_, challenge := pkcePair()
+	codeFrom(t, h.login(authorizeQuery(challenge), "user1@mail.com", password))
+
+	// The password is changed in candy-rain-store, e.g. after a leak.
+	h.store.setPassword(t, 1, "new-password")
+
+	res, err := h.client.Get(h.issuer() + "/authorize?" + authorizeQuery(challenge).Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusOK || res.Header.Get("Location") != "" {
+		t.Fatalf("the old session must not issue a code: %d %q", res.StatusCode, res.Header.Get("Location"))
+	}
+	cleared := false
+	for _, c := range res.Cookies() {
+		if c.Name == sessionName && c.MaxAge < 0 {
+			cleared = true
+		}
+	}
+	if !cleared {
+		t.Fatal("the stale session cookie should be cleared")
+	}
+
+	// The new password signs in again and the session works as before.
+	codeFrom(t, h.login(authorizeQuery(challenge), "user1@mail.com", "new-password"))
+	res, err = h.client.Get(h.issuer() + "/authorize?" + authorizeQuery(challenge).Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	codeFrom(t, res)
+}
+
+func TestPasswordChangeSignsOutOfTheAccountPage(t *testing.T) {
+	h := newHarness(t)
+	_, challenge := pkcePair()
+	codeFrom(t, h.login(authorizeQuery(challenge), "user1@mail.com", password))
+	h.store.setPassword(t, 1, "new-password")
+
+	res, err := h.client.Get(h.issuer() + "/account")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+	if res.StatusCode != http.StatusOK || !strings.Contains(string(body), `name="next" value="account"`) {
+		t.Fatalf("the account page should ask to sign in again: %d", res.StatusCode)
 	}
 }
