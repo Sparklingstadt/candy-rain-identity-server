@@ -68,6 +68,9 @@ type AvatarStore interface {
 	Put(ctx context.Context, userID int64, email, contentType string, data []byte) (Avatar, error)
 	// Delete removes the user's image. Deleting a missing image is not an error.
 	Delete(ctx context.Context, userID int64) error
+	// DeleteByID removes the image only while it still has this id, so a
+	// stale row can be cleaned up without racing a new upload.
+	DeleteByID(ctx context.Context, id string) error
 }
 
 // PostgresAvatarStore reads and writes idp.user_avatar
@@ -119,6 +122,11 @@ func (s *PostgresAvatarStore) Put(ctx context.Context, userID int64, email, cont
 
 func (s *PostgresAvatarStore) Delete(ctx context.Context, userID int64) error {
 	_, err := s.pool.Exec(ctx, `DELETE FROM idp.user_avatar WHERE user_id = $1`, userID)
+	return err
+}
+
+func (s *PostgresAvatarStore) DeleteByID(ctx context.Context, id string) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM idp.user_avatar WHERE avatar_id = $1`, id)
 	return err
 }
 
@@ -176,5 +184,16 @@ func (m *MemoryAvatarStore) Delete(_ context.Context, userID int64) error {
 	m.mu.Lock()
 	delete(m.avatars, userID)
 	m.mu.Unlock()
+	return nil
+}
+
+func (m *MemoryAvatarStore) DeleteByID(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for uid, a := range m.avatars {
+		if a.ID == id {
+			delete(m.avatars, uid)
+		}
+	}
 	return nil
 }

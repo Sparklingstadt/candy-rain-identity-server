@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"hash/crc32"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -28,7 +29,9 @@ import (
 const (
 	msgBadType    = "画像は PNG・JPEG・WebP のいずれかにしてください"
 	msgTooBig     = "画像は 1MB 以下にしてください"
-	msgTooLarge   = "画像は 4096×4096 ピクセル以下にしてください"
+	msgTooLarge   = "画像は縦横 2048 ピクセル以下にしてください"
+	msgTooMany    = "画像は 300 万画素（2048×1536）以下にしてください"
+	msgBusy       = "ただいま混み合っています。少し時間をおいてもう一度お試しください"
 	msgUnreadable = "画像を読み込めませんでした"
 	msgMissing    = "画像を選択してください"
 	msgUpdated    = "プロフィール画像を更新しました"
@@ -186,13 +189,35 @@ func TestAvatarOfAnotherEmailIsIgnored(t *testing.T) {
 	if _, ok := info["picture"]; ok {
 		t.Error("userinfo has another user's picture")
 	}
+	// The stale row is removed as soon as it is seen.
+	if _, err := h.avatars.ForUser(context.Background(), 1); !errors.Is(err, user.ErrNoAvatar) {
+		t.Errorf("stale row kept after the claim lookup: %v", err)
+	}
+
+	for _, see := range []func(){
+		func() { h.get("/avatars/" + a.ID) },
+		func() { h.client.Jar, _ = cookiejar.New(nil); h.accountLogin() },
+	} {
+		a, _ = h.avatars.Put(context.Background(), 1, "previous-owner@mail.com", "image/png", pngOf(4, 4))
+		see()
+		if _, err := h.avatars.ForUser(context.Background(), 1); !errors.Is(err, user.ErrNoAvatar) {
+			t.Errorf("stale row kept: %v", err)
+		}
+	}
 	if res, _ := h.get("/avatars/" + a.ID); res.StatusCode != http.StatusNotFound {
 		t.Errorf("/avatars of a stale row: %d", res.StatusCode)
 	}
-	h.client.Jar, _ = cookiejar.New(nil)
-	h.accountLogin()
 	if _, body := h.get("/account"); strings.Contains(body, "/avatars/") {
 		t.Error("account page shows another user's avatar")
+	}
+
+	// A stale row of a user that no longer exists is removed too.
+	gone, _ := h.avatars.Put(context.Background(), 99, "deleted@mail.com", "image/png", pngOf(4, 4))
+	if res, _ := h.get("/avatars/" + gone.ID); res.StatusCode != http.StatusNotFound {
+		t.Errorf("/avatars of a deleted user: %d", res.StatusCode)
+	}
+	if _, err := h.avatars.ForUser(context.Background(), 99); !errors.Is(err, user.ErrNoAvatar) {
+		t.Errorf("row of a deleted user kept: %v", err)
 	}
 }
 
@@ -209,7 +234,8 @@ func (failingAvatars) ByID(context.Context, string) (user.Avatar, error) {
 func (failingAvatars) Put(context.Context, int64, string, string, []byte) (user.Avatar, error) {
 	return user.Avatar{}, errAvatarDB
 }
-func (failingAvatars) Delete(context.Context, int64) error { return errAvatarDB }
+func (failingAvatars) Delete(context.Context, int64) error      { return errAvatarDB }
+func (failingAvatars) DeleteByID(context.Context, string) error { return errAvatarDB }
 
 // A broken avatar store (e.g. the migration is not applied yet) must not
 // break sign-in: the picture claim is just omitted.
@@ -593,6 +619,7 @@ func TestAvatarUpload(t *testing.T) {
 		{"jpeg stays jpeg", jpegOf(40, 30), "jpeg", 40, 30},
 		{"webp becomes png", webpBytes, "png", 1, 1},
 		{"downscaled to fit 512", big, "png", 512, 256},
+		{"at the pixel limit", pngOf(2048, 1536), "png", 512, 384},
 		{"tall jpeg downscaled", jpegOf(300, 1200), "jpeg", 128, 512},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -658,8 +685,10 @@ func TestAvatarUploadValidation(t *testing.T) {
 		{"jpeg magic then junk", append([]byte("\xff\xd8\xff\xe0"), bytes.Repeat([]byte("junk"), 64)...), "decode", msgUnreadable},
 		{"webp magic then junk", append([]byte("RIFF\x24\x00\x00\x00WEBPVP8 "), bytes.Repeat([]byte("junk"), 64)...), "decode", msgUnreadable},
 		{"truncated png", pngOf(64, 64)[:100], "decode", msgUnreadable},
-		{"too wide", pngOf(4097, 1), "dimensions", msgTooLarge},
-		{"too tall", pngOf(1, 4097), "dimensions", msgTooLarge},
+		{"too wide", pngOf(2049, 1), "dimensions", msgTooLarge},
+		{"too tall", pngOf(1, 2049), "dimensions", msgTooLarge},
+		{"too many pixels", pngOf(2048, 1537), "pixels", msgTooMany},
+		{"too many pixels, portrait", pngOf(1537, 2048), "pixels", msgTooMany},
 		{"empty", []byte{}, "missing", msgMissing},
 		{"no file", nil, "missing", msgMissing},
 		{"over 1MB", append(pngOf(8, 8), make([]byte, 1<<20)...), "size", msgTooBig},
@@ -683,12 +712,13 @@ func TestAvatarUploadValidation(t *testing.T) {
 		h := newHarness(t)
 		csrf := h.accountLogin()
 		bomb := pngOf(1, 1)
-		// Rewrite IHDR to 50000×50000 (the CRC no longer matches, which
-		// DecodeConfig does not check; the dimension check must reject it).
+		// Rewrite IHDR to 50000×50000 with a valid CRC; the dimension
+		// check must reject it before anything is decoded.
 		binary.BigEndian.PutUint32(bomb[16:], 50000)
 		binary.BigEndian.PutUint32(bomb[20:], 50000)
+		binary.BigEndian.PutUint32(bomb[29:], crc32.ChecksumIEEE(bomb[12:29]))
 		loc, _ := h.uploadAndFollow(csrf, bomb)
-		if loc != "/account?error=dimensions" && loc != "/account?error=decode" {
+		if loc != "/account?error=dimensions" {
 			t.Fatalf("location %q", loc)
 		}
 		if _, ok := h.avatar(); ok {

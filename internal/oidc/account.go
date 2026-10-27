@@ -62,7 +62,22 @@ func (s *Server) userAvatar(ctx context.Context, u user.User) (a user.Avatar, ok
 	if err != nil {
 		return user.Avatar{}, false, err
 	}
-	return a, a.BelongsTo(u), nil
+	if !a.BelongsTo(u) {
+		s.dropStaleAvatar(ctx, a)
+		return user.Avatar{}, false, nil
+	}
+	return a, true, nil
+}
+
+// dropStaleAvatar deletes a row left behind by a deleted user or an old
+// email, so its image and email do not stay at rest. It deletes by avatar
+// id, so it never removes an image uploaded since. Failures are only logged.
+func (s *Server) dropStaleAvatar(ctx context.Context, a user.Avatar) {
+	if err := s.opts.Avatars.DeleteByID(ctx, a.ID); err != nil {
+		s.opts.Logger.Warn("stale avatar cleanup failed", "err", err)
+		return
+	}
+	s.opts.Logger.Info("stale avatar removed", "user_id", a.UserID)
 }
 
 // pictureURL returns the picture claim, or "" when the user has no avatar.
@@ -100,6 +115,7 @@ func (s *Server) handleAvatar(w http.ResponseWriter, r *http.Request) {
 	// id (there is no foreign key to "User").
 	u, err := s.opts.Users.FindByID(r.Context(), a.UserID)
 	if errors.Is(err, user.ErrNotFound) || (err == nil && !a.BelongsTo(u)) {
+		s.dropStaleAvatar(r.Context(), a)
 		avatarNotFound(w)
 		return
 	}
@@ -249,7 +265,15 @@ func (s *Server) handleAvatarUpload(w http.ResponseWriter, r *http.Request) {
 		redirectAccountError(w, r, code)
 		return
 	}
+	// Decoding can take tens of MB, so only a few run at once; the rest
+	// wait briefly and are then turned away instead of piling up.
+	if !s.decodes.acquire(r.Context()) {
+		s.opts.Logger.Warn("avatar upload turned away: decoder busy", "sub", u.Subject())
+		redirectAccountError(w, r, errAvatarBusy)
+		return
+	}
 	out, contentType, code := processAvatar(data)
+	s.decodes.release()
 	if code != "" {
 		redirectAccountError(w, r, code)
 		return

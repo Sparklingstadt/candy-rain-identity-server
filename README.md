@@ -50,7 +50,7 @@ candy-rain-store ──⑤/token でコードを ID トークンに交換（clie
 - `/account` の未サインイン時のログインは、フォームに URL ではなく固定の値 `next=account` を持たせ、サーバー側で固定パス `/account` にだけ戻す（任意の戻り先を受け取らないのでオープンリダイレクトにならない）。`next` がそれ以外の値なら通常の認可リクエストとして扱い、登録済みの client・`redirect_uri` でなければエラー画面になる
 - `/account` のログインフォームは、クライアントのログインフォームとは別の CSRF Cookie を使う（別タブで開いているストアのログインを壊さない）
 - 画像のアップロード・削除は、サインイン状態に加えて CSRF トークン（サインイン Cookie に紐づけた HMAC）が必要。結果はすべて固定のコード付きで `/account` へリダイレクトし、URL の値をそのまま画面に出さない
-- 画像の種類はファイル名や Content-Type ではなく先頭のバイト列で判定し、PNG・JPEG・WebP 以外（SVG・HTML など）は受け付けない。デコードの前に縦横 4096 ピクセルを超えるものを拒否し、デコード・縮小・再エンコードした画像だけを保存する（[プロフィール画像](#プロフィール画像)）。リクエスト全体を `http.MaxBytesReader` で制限
+- 画像の種類はファイル名や Content-Type ではなく先頭のバイト列で判定し、PNG・JPEG・WebP 以外（SVG・HTML など）は受け付けない。デコードの前に縦横 2048 ピクセル・300 万画素を超えるものを拒否し、デコード・縮小・再エンコードした画像だけを保存する（[プロフィール画像](#プロフィール画像)）。デコードは多くのメモリを使うため、同時に 2 件までに制限し、空きを 5 秒待っても空かなければ「混み合っています」と表示して断る（待ち行列を無制限に伸ばさない）。リクエスト全体を `http.MaxBytesReader` で制限
 
 **認可コード**：サーバーに保存せず、`SESSION_SECRET` から作った鍵で暗号化（AES-GCM）した値をそのまま認可コードにしています。そのため複数インスタンスやサーバーレス（Vercel Functions）でも、別のインスタンスが発行したコードを交換できます。使用済みコードの記録はインスタンスごとのベストエフォートですが、再利用するには client secret と PKCE の verifier も必要です。
 
@@ -58,7 +58,7 @@ candy-rain-store ──⑤/token でコードを ID トークンに交換（clie
 
 ## プロフィール画像
 
-ユーザーは `<ISSUER>/account` でプロフィール画像を登録・削除できます（PNG・JPEG・WebP、1MB 以下、4096×4096 ピクセル以下）。
+ユーザーは `<ISSUER>/account` でプロフィール画像を登録・削除できます（PNG・JPEG・WebP、1MB 以下、縦横 2048 ピクセル以下かつ 300 万画素（2048×1536）以下）。スマートフォンの写真は、端末やアプリで縮小してからアップロードしてください。
 
 画像は ID サーバー自身の `idp` スキーマ（`idp.user_avatar` テーブル）にだけ保存します。ID サーバーが書き込むのはこのスキーマだけです。ストアの `User` テーブルには、書き込みも、外部キー・トリガーの追加もしません（読み取るだけです）。
 
@@ -82,13 +82,13 @@ Auth.js（candy-rain-stores）の OIDC プロバイダーは、既定の `profil
 ### プライバシー
 
 - 画像は URL を知っていれば誰でも見られます。サインインしたすべてのクライアント（ストアなど）に `picture` として渡ります
-- アップロードされた画像はいったんデコードし、512×512 に収まるよう縮小して再エンコードしたものだけを保存・配信します（JPEG は品質 85 の JPEG、PNG・WebP は PNG）。JPEG の EXIF の向き（Orientation）は再エンコードの前に画素へ反映するので、スマートフォンの写真も正しい向きで表示されます。EXIF（撮影場所の GPS・機種・日時など）や、その他のメタデータは残りません。デコードできない画像は「画像を読み込めませんでした」で拒否します
+- アップロードされた画像はいったんデコードし、512×512 に収まるよう縮小して再エンコードしたものだけを保存・配信します（JPEG は品質 85 の JPEG、PNG・WebP は PNG）。JPEG の EXIF の向き（Orientation）は再エンコードの前に画素へ反映するので、スマートフォンの写真も正しい向きで表示されます（PNG・WebP に埋め込まれた EXIF の向きは反映しません。まれですが、その場合は横向きのまま保存されます）。EXIF（撮影場所の GPS・機種・日時など）や、その他のメタデータは残りません。デコードできない画像は「画像を読み込めませんでした」で拒否します
 - 削除・差し替えた画像はサーバーからは配信されなくなりますが、ブラウザーや共有キャッシュに残ったコピーは最長 1 年残ることがあります（URL を知っている人のキャッシュに限られます）
 - 画像にはアップロード時のメールアドレスを記録し、現在の `User.email` と一致するときだけ表示します。ユーザー削除や開発 DB の作り直しで同じ id が別の人に再利用されても、前の人の画像は表示されません
 
 ### マイグレーション（手動で一度だけ）
 
-`idp` スキーマと `idp.user_avatar` は起動時には作成しません。デプロイ前に [migrations/001_user_avatar.sql](migrations/001_user_avatar.sql) を `DATABASE_URL` と同じデータベースに適用してください（`IF NOT EXISTS` なので、二度実行しても壊れません）。
+`idp` スキーマと `idp.user_avatar` は起動時には作成しません。デプロイ前に [migrations/001_user_avatar.sql](migrations/001_user_avatar.sql) を `DATABASE_URL` と同じデータベースに適用してください（`IF NOT EXISTS` なので、二度実行しても壊れません）。開発中の古い版（外部キー付きや `etag` 列のもの）を適用済みのデータベースでは、マイグレーションがエラーで止まります。その場合は `DROP TABLE idp.user_avatar;`（と、あれば `DROP TABLE public.idp_user_avatar;`）を実行してから適用し直してください。
 
 ```bash
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/001_user_avatar.sql
@@ -96,6 +96,7 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/001_user_avatar.sql
 
 ```sql
 CREATE SCHEMA IF NOT EXISTS idp;
+-- （実際のファイルには、古い版のテーブルを検出して止めるチェックもあります）
 
 CREATE TABLE IF NOT EXISTS idp.user_avatar (
   user_id      integer     PRIMARY KEY,
@@ -109,7 +110,7 @@ ALTER TABLE idp.user_avatar ENABLE ROW LEVEL SECURITY;
 ```
 
 - `idp` スキーマは ID サーバーが所有します。candy-rain-store の Prisma は `public` スキーマだけを管理するので、`idp` は見えません（`prisma migrate dev` のドリフト検出や `prisma db push` の削除対象になりません）
-- `user_id` は `"User".id` ですが、外部キーにはしていません。`public` スキーマには何も作らないので、ストア側の `TRUNCATE`・`DROP`・`prisma migrate reset` にも影響しません。ユーザーを削除しても行は残りますが、メールアドレスが一致しないため表示されません（同じユーザーが画像を登録し直すと上書きされます）
+- `user_id` は `"User".id` ですが、外部キーにはしていません。`public` スキーマには何も作らないので、ストア側の `TRUNCATE`・`DROP`・`prisma migrate reset` にも影響しません。ユーザーの削除やメールアドレスの変更で持ち主と一致しなくなった行は表示せず、見つけた時点（`/avatars`・`picture` の発行・`/account`）で削除します。一度も参照されない行をまとめて消すには、`DELETE FROM idp.user_avatar a WHERE NOT EXISTS (SELECT 1 FROM public."User" u WHERE u.id = a.user_id AND u.email = a.email);` を実行します（"User" は読むだけです）
 - Supabase では Data API（PostgREST）から見えないよう RLS を有効にし、ポリシーは作りません。ID サーバーはテーブル所有者のロール（Supabase の `postgres` など）で接続する前提です。別のロールで接続する場合は、`idp` スキーマの `USAGE` とテーブルの `SELECT, INSERT, UPDATE, DELETE` を付与したうえで、そのロールに `BYPASSRLS` を付けるか、そのロール用のポリシーを作ってください（権限の付与だけでは RLS により 0 行になります）
 - 適用前にデプロイしても、サインインは止まりません（`picture` が出ないだけ）。`/account` と `/avatars` はエラーになります
 

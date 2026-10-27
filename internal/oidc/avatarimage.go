@@ -11,9 +11,13 @@ import (
 )
 
 const (
-	// maxAvatarSide rejects larger images before they are decoded, so a
-	// small file that declares a huge canvas cannot exhaust memory.
-	maxAvatarSide = 4096
+	// maxAvatarSide and maxAvatarPixels reject larger images before they
+	// are decoded. Decoding costs far more memory than the file size
+	// suggests: a 193 KB progressive 4096×4096 JPEG allocates about 305 MB.
+	// At 2048×1536 the worst case is about a fifth of that, and
+	// decodeLimiter bounds how many run at once.
+	maxAvatarSide   = 2048
+	maxAvatarPixels = 2048 * 1536
 	// avatarSide is the box the stored image is scaled down to fit.
 	avatarSide  = 512
 	jpegQuality = 85
@@ -27,6 +31,8 @@ const (
 	errAvatarType       avatarError = "type"
 	errAvatarSize       avatarError = "size"
 	errAvatarDimensions avatarError = "dimensions"
+	errAvatarPixels     avatarError = "pixels"
+	errAvatarBusy       avatarError = "busy"
 	errAvatarDecode     avatarError = "decode"
 	errAvatarMissing    avatarError = "missing"
 	errAvatarMultiple   avatarError = "multiple"
@@ -35,7 +41,9 @@ const (
 var avatarErrorMessages = map[string]string{
 	string(errAvatarType):       "画像は PNG・JPEG・WebP のいずれかにしてください",
 	string(errAvatarSize):       "画像は 1MB 以下にしてください",
-	string(errAvatarDimensions): "画像は 4096×4096 ピクセル以下にしてください",
+	string(errAvatarDimensions): "画像は縦横 2048 ピクセル以下にしてください",
+	string(errAvatarPixels):     "画像は 300 万画素（2048×1536）以下にしてください",
+	string(errAvatarBusy):       "ただいま混み合っています。少し時間をおいてもう一度お試しください",
 	string(errAvatarDecode):     "画像を読み込めませんでした",
 	string(errAvatarMissing):    "画像を選択してください",
 	string(errAvatarMultiple):   "画像は 1 枚だけ選択してください",
@@ -73,6 +81,9 @@ func processAvatar(data []byte) (out []byte, contentType string, code avatarErro
 	}
 	if cfg.Width > maxAvatarSide || cfg.Height > maxAvatarSide {
 		return nil, "", errAvatarDimensions
+	}
+	if cfg.Width*cfg.Height > maxAvatarPixels {
+		return nil, "", errAvatarPixels
 	}
 	src, decoded, err := image.Decode(bytes.NewReader(data))
 	if err != nil || decoded != format {

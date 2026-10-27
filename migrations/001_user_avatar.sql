@@ -7,6 +7,20 @@
 
 CREATE SCHEMA IF NOT EXISTS idp;
 
+-- 以前の下書き（外部キー付き・etag 列のもの）を適用済みだと、下の
+-- CREATE TABLE IF NOT EXISTS は何もせずに通り、実行時に列がないエラーになる。
+-- そうならないよう、ここで止める。
+DO $$
+BEGIN
+  IF to_regclass('idp.user_avatar') IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'idp' AND table_name = 'user_avatar' AND column_name = 'avatar_id'
+  ) THEN
+    RAISE EXCEPTION 'idp.user_avatar is from an earlier draft: DROP TABLE idp.user_avatar (and public.idp_user_avatar), then apply this file again';
+  END IF;
+END
+$$;
+
 -- user_id は "User".id だが、外部キーにはしない。代わりにアップロード時の
 -- email を保存し、現在の "User".email と一致するときだけ画像を出す
 -- （ユーザー削除や開発 DB の作り直しで id が再利用されても、別人に付かない）。
