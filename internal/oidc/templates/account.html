@@ -15,7 +15,7 @@
   <input type="hidden" name="csrf_token" value="{{.CSRF}}">
   <label for="avatar">画像ファイル</label>
   <input id="avatar" name="avatar" type="file" accept="image/png,image/jpeg,image/webp" required>
-  <p class="hint">PNG・JPEG・WebP、1MB 以下。登録した画像は Candy Rain ID でサインインするサービスに表示されます。</p>
+  <p class="hint">PNG・JPEG・WebP、1MB 以下、縦横 2048 ピクセル以下（300 万画素まで）。登録した画像は Candy Rain ID でサインインするサービスに表示されます。</p>
   <button type="submit">アップロード</button>
 </form>
 {{if .Avatar}}

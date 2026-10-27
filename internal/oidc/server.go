@@ -61,6 +61,7 @@ type Server struct {
 	clients       map[string]config.Client
 	codes         *codeStore
 	sessions      sessionCodec
+	decodes       *decodeLimiter
 	secureCookies bool
 	handler       http.Handler
 }
@@ -80,6 +81,7 @@ func New(opts Options) *Server {
 		clients:       make(map[string]config.Client, len(opts.Clients)),
 		codes:         newCodeStore(opts.SessionSecret),
 		sessions:      sessionCodec{secret: opts.SessionSecret},
+		decodes:       newServerDecodeLimiter(),
 		secureCookies: strings.HasPrefix(opts.Issuer, "https://"),
 	}
 	for _, c := range opts.Clients {

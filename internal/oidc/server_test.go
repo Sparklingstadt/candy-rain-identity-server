@@ -62,6 +62,7 @@ type harness struct {
 	client  *http.Client
 	signer  *Signer
 	avatars *user.MemoryAvatarStore
+	srv     *Server
 }
 
 func newHarness(t *testing.T) *harness {
@@ -88,7 +89,7 @@ func newHarnessWith(t *testing.T, avatars user.AvatarStore) *harness {
 	h := &harness{t: t, signer: signer}
 	h.ts = httptest.NewUnstartedServer(nil)
 	issuer := "http://" + h.ts.Listener.Addr().String()
-	h.ts.Config.Handler = New(Options{
+	h.srv = New(Options{
 		Issuer: issuer,
 		Clients: []config.Client{{
 			ID: clientID, Secret: clientSecret,
@@ -102,6 +103,7 @@ func newHarnessWith(t *testing.T, avatars user.AvatarStore) *harness {
 		Signer:        signer,
 		SessionSecret: []byte(strings.Repeat("s", 32)),
 	})
+	h.ts.Config.Handler = h.srv
 	h.ts.Start()
 	t.Cleanup(h.ts.Close)
 

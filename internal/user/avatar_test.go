@@ -71,10 +71,26 @@ func TestPostgresAvatarStore(t *testing.T) {
 	if err != nil || meta.ID != b.ID || meta.ContentType != "image/jpeg" || meta.Data != nil {
 		t.Fatalf("ForUser: %+v %v", meta, err)
 	}
+	// DeleteByID removes only that version of the image.
+	if err := s.DeleteByID(ctx, a.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ByID(ctx, b.ID); err != nil {
+		t.Fatalf("DeleteByID of an old id removed the current image: %v", err)
+	}
+	if err := s.DeleteByID(ctx, b.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ForUser(ctx, uid); !errors.Is(err, ErrNoAvatar) {
+		t.Fatalf("DeleteByID kept the row: %v", err)
+	}
+	if _, err := s.Put(ctx, uid, "it@mail.test", "image/png", []byte("third")); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.Delete(ctx, uid); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.ByID(ctx, b.ID); !errors.Is(err, ErrNoAvatar) {
-		t.Errorf("deleted avatar still served: %v", err)
+	if _, err := s.ForUser(ctx, uid); !errors.Is(err, ErrNoAvatar) {
+		t.Errorf("deleted avatar still stored: %v", err)
 	}
 }
