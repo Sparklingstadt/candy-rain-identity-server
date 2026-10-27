@@ -65,6 +65,12 @@ func Load(logger *slog.Logger) (Config, error) {
 		errs = append(errs, errors.New("OIDC_REDIRECT_URIS is required"))
 	}
 
+	// On Vercel every instance would generate its own key and secret, so
+	// tokens, codes and sessions issued by one would fail on another.
+	if os.Getenv("VERCEL") != "" && (os.Getenv("SIGNING_KEY_PEM") == "" || os.Getenv("SESSION_SECRET") == "") {
+		errs = append(errs, errors.New("SIGNING_KEY_PEM and SESSION_SECRET are required on Vercel"))
+	}
+
 	if pemText := os.Getenv("SIGNING_KEY_PEM"); pemText != "" {
 		key, err := ParseRSAPrivateKey([]byte(pemText))
 		if err != nil {

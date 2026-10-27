@@ -1,9 +1,12 @@
 package oidc
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/json"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,41 +33,69 @@ type authCode struct {
 	ExpiresAt     time.Time
 }
 
-// codeStore keeps authorization codes in memory. Codes live for a minute and
-// can be redeemed once, so running a single instance is enough for this demo;
-// several instances would need a shared store such as Redis or PostgreSQL.
+// codeStore seals authorization codes with AES-GCM instead of storing them,
+// so any instance can redeem a code issued by another (Vercel Functions run
+// several instances and scale to zero). Codes live for a minute; redeemed
+// codes are remembered per instance on a best-effort basis, and replaying one
+// on another instance would still need the client secret and PKCE verifier.
 type codeStore struct {
-	mu    sync.Mutex
-	codes map[string]authCode
+	aead     cipher.AEAD
+	mu       sync.Mutex
+	redeemed map[string]time.Time
 }
 
-func newCodeStore() *codeStore {
-	return &codeStore{codes: map[string]authCode{}}
+func newCodeStore(secret []byte) *codeStore {
+	h := hmac.New(sha256.New, secret)
+	h.Write([]byte("candy-rain-id authorization code"))
+	block, err := aes.NewCipher(h.Sum(nil))
+	if err != nil {
+		panic(err) // a 32-byte key is always valid
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		panic(err)
+	}
+	return &codeStore{aead: aead, redeemed: map[string]time.Time{}}
 }
 
 func (s *codeStore) Issue(c authCode) string {
-	code := randomToken()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := time.Now()
-	for k, v := range s.codes {
-		if now.After(v.ExpiresAt) {
-			delete(s.codes, k)
-		}
+	plaintext, err := json.Marshal(c)
+	if err != nil {
+		panic(err) // authCode always marshals
 	}
-	s.codes[code] = c
-	return code
+	nonce := make([]byte, s.aead.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		panic(err)
+	}
+	return b64.EncodeToString(s.aead.Seal(nonce, nonce, plaintext, nil))
 }
 
-// Redeem returns the code's data and deletes it, so a code works only once.
+// Redeem opens the code and rejects it when expired or already redeemed here.
 func (s *codeStore) Redeem(code string, now time.Time) (authCode, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	c, ok := s.codes[code]
-	delete(s.codes, code)
-	if !ok || now.After(c.ExpiresAt) {
+	raw, err := b64.DecodeString(code)
+	if err != nil || len(raw) < s.aead.NonceSize() {
 		return authCode{}, false
 	}
+	plaintext, err := s.aead.Open(nil, raw[:s.aead.NonceSize()], raw[s.aead.NonceSize():], nil)
+	if err != nil {
+		return authCode{}, false
+	}
+	var c authCode
+	if json.Unmarshal(plaintext, &c) != nil || now.After(c.ExpiresAt) {
+		return authCode{}, false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k, exp := range s.redeemed {
+		if now.After(exp) {
+			delete(s.redeemed, k)
+		}
+	}
+	if _, used := s.redeemed[code]; used {
+		return authCode{}, false
+	}
+	s.redeemed[code] = c.ExpiresAt
 	return c, true
 }
 
