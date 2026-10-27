@@ -1,5 +1,7 @@
 // Package oidc implements a small OpenID Connect provider: the authorization
-// code flow with PKCE for one confidential client (candy-rain-store).
+// code flow with PKCE for confidential clients such as candy-rain-store and
+// candy-rain-stores. The sign-in session is shared, so signing in to one
+// client signs the user in to the others too (SSO).
 package oidc
 
 import (
@@ -43,7 +45,7 @@ var dummyHash, _ = bcrypt.GenerateFromPassword([]byte("candy-rain-dummy-password
 
 type Options struct {
 	Issuer        string
-	Client        config.Client
+	Clients       []config.Client
 	Users         user.Store
 	Signer        *Signer
 	SessionSecret []byte
@@ -55,6 +57,7 @@ type Options struct {
 
 type Server struct {
 	opts          Options
+	clients       map[string]config.Client
 	codes         *codeStore
 	sessions      sessionCodec
 	secureCookies bool
@@ -70,9 +73,13 @@ func New(opts Options) *Server {
 	}
 	s := &Server{
 		opts:          opts,
+		clients:       make(map[string]config.Client, len(opts.Clients)),
 		codes:         newCodeStore(opts.SessionSecret),
 		sessions:      sessionCodec{secret: opts.SessionSecret},
 		secureCookies: strings.HasPrefix(opts.Issuer, "https://"),
+	}
+	for _, c := range opts.Clients {
+		s.clients[c.ID] = c
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /.well-known/openid-configuration", s.handleDiscovery)
@@ -167,7 +174,8 @@ func (a authRequest) hasScope(scope string) bool {
 // redirect_uri, or by showing an error page when the client or redirect_uri
 // itself is untrusted (redirecting there would make this an open redirector).
 func (s *Server) validate(w http.ResponseWriter, r *http.Request, a authRequest) bool {
-	if a.ClientID != s.opts.Client.ID || !slices.Contains(s.opts.Client.RedirectURIs, a.RedirectURI) {
+	client, ok := s.clients[a.ClientID]
+	if !ok || !slices.Contains(client.RedirectURIs, a.RedirectURI) {
 		s.renderError(w, http.StatusBadRequest, "ログイン要求が正しくありません。ストアからもう一度サインインしてください。")
 		return false
 	}
@@ -314,7 +322,8 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 		tokenError(w, http.StatusBadRequest, "invalid_request", "malformed form body")
 		return
 	}
-	if !s.authenticateClient(r) {
+	client, ok := s.authenticateClient(r)
+	if !ok {
 		w.Header().Set("WWW-Authenticate", `Basic realm="token"`)
 		tokenError(w, http.StatusUnauthorized, "invalid_client", "client authentication failed")
 		return
@@ -326,7 +335,8 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 
 	now := s.opts.Now()
 	c, ok := s.codes.Redeem(r.PostForm.Get("code"), now)
-	if !ok || c.ClientID != s.opts.Client.ID || c.RedirectURI != r.PostForm.Get("redirect_uri") ||
+	// A code is only redeemable by the client it was issued to.
+	if !ok || c.ClientID != client.ID || c.RedirectURI != r.PostForm.Get("redirect_uri") ||
 		!verifyPKCE(r.PostForm.Get("code_verifier"), c.CodeChallenge) {
 		tokenError(w, http.StatusBadRequest, "invalid_grant", "the code is invalid, expired, or does not match")
 		return
@@ -380,7 +390,7 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) authenticateClient(r *http.Request) bool {
+func (s *Server) authenticateClient(r *http.Request) (config.Client, bool) {
 	id, secret, ok := r.BasicAuth()
 	if ok {
 		// RFC 6749 §2.3.1: Basic credentials are form-urlencoded first.
@@ -388,14 +398,19 @@ func (s *Server) authenticateClient(r *http.Request) bool {
 		id, err1 = url.QueryUnescape(id)
 		secret, err2 = url.QueryUnescape(secret)
 		if err1 != nil || err2 != nil {
-			return false
+			return config.Client{}, false
 		}
 	} else {
 		id, secret = r.PostForm.Get("client_id"), r.PostForm.Get("client_secret")
 	}
-	idOK := subtle.ConstantTimeCompare([]byte(id), []byte(s.opts.Client.ID)) == 1
-	secretOK := subtle.ConstantTimeCompare([]byte(secret), []byte(s.opts.Client.Secret)) == 1
-	return idOK && secretOK
+	client, ok := s.clients[id]
+	if !ok {
+		return config.Client{}, false
+	}
+	if subtle.ConstantTimeCompare([]byte(secret), []byte(client.Secret)) != 1 {
+		return config.Client{}, false
+	}
+	return client, true
 }
 
 func verifyPKCE(verifier, challenge string) bool {
@@ -460,7 +475,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, s.cookie(sessionName, "", "/", -1))
 	q := r.URL.Query()
 	target := q.Get("post_logout_redirect_uri")
-	if target != "" && slices.Contains(s.opts.Client.PostLogoutRedirectURIs, target) {
+	if target != "" && s.allowedPostLogoutRedirect(q.Get("client_id"), target) {
 		u, err := url.Parse(target)
 		if err == nil {
 			if state := q.Get("state"); state != "" {
@@ -476,6 +491,21 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 		"Title":   "サインアウトしました",
 		"Message": "Candy Rain ID からサインアウトしました。",
 	})
+}
+
+// allowedPostLogoutRedirect reports whether target is registered for the
+// client named by clientID, or for any client when clientID is empty.
+func (s *Server) allowedPostLogoutRedirect(clientID, target string) bool {
+	if clientID != "" {
+		c, ok := s.clients[clientID]
+		return ok && slices.Contains(c.PostLogoutRedirectURIs, target)
+	}
+	for _, c := range s.clients {
+		if slices.Contains(c.PostLogoutRedirectURIs, target) {
+			return true
+		}
+	}
+	return false
 }
 
 // ---- rendering helpers ----
