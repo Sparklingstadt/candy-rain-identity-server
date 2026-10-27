@@ -32,7 +32,7 @@ func AvatarETag(data []byte) string {
 }
 
 // AvatarStore keeps profile images in a table owned by the identity server
-// (idp_user_avatar), never in the "User" table, which belongs to
+// (idp.user_avatar), never in the "User" table, which belongs to
 // candy-rain-store.
 type AvatarStore interface {
 	// Get returns the image, or ErrNoAvatar.
@@ -46,7 +46,7 @@ type AvatarStore interface {
 	Delete(ctx context.Context, userID int64) error
 }
 
-// PostgresAvatarStore reads and writes idp_user_avatar
+// PostgresAvatarStore reads and writes idp.user_avatar
 // (migrations/001_user_avatar.sql). The table is created by hand, not at
 // startup.
 type PostgresAvatarStore struct {
@@ -60,7 +60,7 @@ func NewPostgresAvatarStore(pool *pgxpool.Pool) *PostgresAvatarStore {
 func (s *PostgresAvatarStore) Get(ctx context.Context, userID int64) (Avatar, error) {
 	var a Avatar
 	err := s.pool.QueryRow(ctx,
-		`SELECT content_type, data, etag, updated_at FROM idp_user_avatar WHERE user_id = $1`, userID,
+		`SELECT content_type, data, etag, updated_at FROM idp.user_avatar WHERE user_id = $1`, userID,
 	).Scan(&a.ContentType, &a.Data, &a.ETag, &a.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Avatar{}, ErrNoAvatar
@@ -70,7 +70,7 @@ func (s *PostgresAvatarStore) Get(ctx context.Context, userID int64) (Avatar, er
 
 func (s *PostgresAvatarStore) ETag(ctx context.Context, userID int64) (string, error) {
 	var etag string
-	err := s.pool.QueryRow(ctx, `SELECT etag FROM idp_user_avatar WHERE user_id = $1`, userID).Scan(&etag)
+	err := s.pool.QueryRow(ctx, `SELECT etag FROM idp.user_avatar WHERE user_id = $1`, userID).Scan(&etag)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", ErrNoAvatar
 	}
@@ -80,7 +80,7 @@ func (s *PostgresAvatarStore) ETag(ctx context.Context, userID int64) (string, e
 func (s *PostgresAvatarStore) Put(ctx context.Context, userID int64, contentType string, data []byte) (Avatar, error) {
 	a := Avatar{ContentType: contentType, Data: data, ETag: AvatarETag(data)}
 	err := s.pool.QueryRow(ctx, `
-		INSERT INTO idp_user_avatar (user_id, content_type, data, etag, updated_at)
+		INSERT INTO idp.user_avatar (user_id, content_type, data, etag, updated_at)
 		VALUES ($1, $2, $3, $4, now())
 		ON CONFLICT (user_id) DO UPDATE
 		SET content_type = EXCLUDED.content_type, data = EXCLUDED.data, etag = EXCLUDED.etag, updated_at = now()
@@ -91,7 +91,7 @@ func (s *PostgresAvatarStore) Put(ctx context.Context, userID int64, contentType
 }
 
 func (s *PostgresAvatarStore) Delete(ctx context.Context, userID int64) error {
-	_, err := s.pool.Exec(ctx, `DELETE FROM idp_user_avatar WHERE user_id = $1`, userID)
+	_, err := s.pool.Exec(ctx, `DELETE FROM idp.user_avatar WHERE user_id = $1`, userID)
 	return err
 }
 

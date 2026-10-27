@@ -56,7 +56,7 @@ candy-rain-store ──⑤/token でコードを ID トークンに交換（clie
 
 ## プロフィール画像
 
-ユーザーは `<ISSUER>/account` でプロフィール画像を登録・削除できます（PNG・JPEG・WebP、1MB 以下）。画像は ID サーバーが持つ `idp_user_avatar` テーブルに保存し、ストアの `User` テーブルには書き込みません。
+ユーザーは `<ISSUER>/account` でプロフィール画像を登録・削除できます（PNG・JPEG・WebP、1MB 以下）。画像は ID サーバーが所有する `idp` スキーマの `idp.user_avatar` テーブルに保存し、ストアの `User` テーブルには書き込みません。
 
 ### クライアントから使う
 
@@ -75,27 +75,30 @@ Auth.js（candy-rain-stores）の OIDC プロバイダーは、既定の `profil
 
 ### マイグレーション（手動で一度だけ）
 
-`idp_user_avatar` は起動時には作成しません。デプロイ前に [migrations/001_user_avatar.sql](migrations/001_user_avatar.sql) を `DATABASE_URL` と同じデータベースに適用してください（`CREATE TABLE IF NOT EXISTS` なので、二度実行しても壊れません）。
+`idp` スキーマと `idp.user_avatar` は起動時には作成しません。デプロイ前に [migrations/001_user_avatar.sql](migrations/001_user_avatar.sql) を `DATABASE_URL` と同じデータベースに適用してください（`IF NOT EXISTS` なので、二度実行しても壊れません）。
 
 ```bash
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/001_user_avatar.sql
 ```
 
 ```sql
-CREATE TABLE IF NOT EXISTS idp_user_avatar (
-  user_id      integer     PRIMARY KEY REFERENCES "User"(id) ON DELETE CASCADE,
+CREATE SCHEMA IF NOT EXISTS idp;
+
+CREATE TABLE IF NOT EXISTS idp.user_avatar (
+  user_id      integer     PRIMARY KEY REFERENCES public."User"(id) ON DELETE CASCADE,
   content_type text        NOT NULL,
   data         bytea       NOT NULL,
   etag         text        NOT NULL,
   updated_at   timestamptz NOT NULL DEFAULT now()
 );
-ALTER TABLE idp_user_avatar ENABLE ROW LEVEL SECURITY;
+ALTER TABLE idp.user_avatar ENABLE ROW LEVEL SECURITY;
 ```
 
-- `"User"` は参照するだけで変更しません（外部キーで、ユーザーを削除すると画像も消えます）
+- `idp` スキーマは ID サーバーが所有します。candy-rain-store の Prisma は `public` スキーマだけを管理するので、`idp` は見えません（`prisma migrate dev` のドリフト検出や `prisma db push` の削除対象になりません）
+- `public."User"` は参照するだけで変更しません（外部キーで、ユーザーを削除すると画像も消えます）
 - Supabase では Data API（PostgREST）から見えないよう RLS を有効にし、ポリシーは作りません。ID サーバーはテーブル所有者のロールで接続する前提です（別のロールで接続する場合は、そのロールに `SELECT, INSERT, UPDATE, DELETE` を付与し、RLS を回避できるようにしてください）
 - 適用前にデプロイしても、サインインは止まりません（`picture` が出ないだけ）。`/account` と `/avatars` はエラーになります
-- candy-rain-store 側で `prisma migrate dev` や `prisma db push` を使うと、このテーブルを「スキーマにないもの」として扱います。ストアの開発 DB をリセットしたときは、このマイグレーションを再適用してください
+- ストアの開発 DB を `prisma migrate reset` などで作り直すと、`public` スキーマごと削除されるため外部キーが外れます（`idp.user_avatar` 自体は残ります）。作り直した後は、テーブルを削除してからこのマイグレーションを再適用してください
 
 ## ローカルで動かす
 
