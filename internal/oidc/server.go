@@ -70,7 +70,7 @@ func New(opts Options) *Server {
 	}
 	s := &Server{
 		opts:          opts,
-		codes:         newCodeStore(),
+		codes:         newCodeStore(opts.SessionSecret),
 		sessions:      sessionCodec{secret: opts.SessionSecret},
 		secureCookies: strings.HasPrefix(opts.Issuer, "https://"),
 	}

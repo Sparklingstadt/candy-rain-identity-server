@@ -44,7 +44,9 @@ candy-rain-store ──⑤/token でコードを ID トークンに交換（clie
 - client secret・PKCE の比較は定数時間。Cookie は `HttpOnly` / `SameSite=Lax`、`ISSUER` が https のときは `Secure`
 - CSP・`X-Frame-Options: DENY` などのヘッダーを付与
 
-**制約**：認可コードはメモリに保持するため、1 インスタンスで動かす前提です。複数台にする場合は共有ストア（Redis / PostgreSQL）が必要です。ログイン試行回数の制限は未実装です。
+**認可コード**：サーバーに保存せず、`SESSION_SECRET` から作った鍵で暗号化（AES-GCM）した値をそのまま認可コードにしています。そのため複数インスタンスやサーバーレス（Vercel Functions）でも、別のインスタンスが発行したコードを交換できます。使用済みコードの記録はインスタンスごとのベストエフォートですが、再利用するには client secret と PKCE の verifier も必要です。
+
+**制約**：ログイン試行回数の制限は未実装です。
 
 ## ローカルで動かす
 
@@ -53,7 +55,7 @@ Go 1.26 以降。candy-rain-store の DB（`npm run db:setup`）が起動して�
 ```bash
 cp .env.example .env   # 値を確認
 set -a; . ./.env; set +a
-go run ./cmd/identity-server
+go run ./cmd/server
 ```
 
 candy-rain-store 側の `.env` に以下を追加し、`npm run dev` で起動すると、サインイン画面に「Candy Rain ID でサインイン」が表示されます。
@@ -90,4 +92,10 @@ Discovery・JWKS、ログインから ID トークン発行・userinfo までの
 
 ## デプロイ
 
-`Dockerfile` でビルドできます（distroless・非 root）。Vercel ではなく、Cloud Run / Fly.io / Render などコンテナを常駐できる環境を想定しています。
+### Vercel
+
+`vercel.json` で Go のフレームワークプリセットを指定しており、Vercel が `cmd/server/main.go` をそのまま Vercel Function として動かします。Vercel 上では `SIGNING_KEY_PEM` と `SESSION_SECRET` が必須です（インスタンスごとに鍵が変わるのを防ぐため、未設定だと起動しません）。
+
+### コンテナ
+
+`Dockerfile` でビルドできます（distroless・非 root）。Cloud Run / Fly.io / Render などでも動かせます。
