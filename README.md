@@ -33,6 +33,10 @@ candy-rain-store ──⑤/token でコードを ID トークンに交換（clie
 | `POST /token` | 認可コード → ID トークン・アクセストークン |
 | `GET/POST /userinfo` | アクセストークンでユーザー情報 |
 | `GET /logout` | サインアウト（RP-Initiated Logout） |
+| `GET /account` | アカウント画面（プロフィール画像の登録・削除）。未サインインならログインフォーム |
+| `POST /account/avatar` | プロフィール画像のアップロード（multipart, `avatar` と `csrf_token`） |
+| `POST /account/avatar/delete` | プロフィール画像の削除（`csrf_token`） |
+| `GET /avatars/{id}` | プロフィール画像（`picture` クレームの URL。`id` は推測できない乱数） |
 | `GET /healthz` | ヘルスチェック |
 
 ## セキュリティ上の配慮
@@ -43,10 +47,71 @@ candy-rain-store ──⑤/token でコードを ID トークンに交換（clie
 - 存在しないメールアドレスでもダミーハッシュで bcrypt 照合を行い、応答時間からアカウントの有無を推測されにくくする
 - client secret・PKCE の比較は定数時間。Cookie は `HttpOnly` / `SameSite=Lax`、`ISSUER` が https のときは `Secure`
 - CSP・`X-Frame-Options: DENY` などのヘッダーを付与
+- `/account` の未サインイン時のログインは、フォームに URL ではなく固定の値 `next=account` を持たせ、サーバー側で固定パス `/account` にだけ戻す（任意の戻り先を受け取らないのでオープンリダイレクトにならない）。`next` がそれ以外の値なら通常の認可リクエストとして扱い、登録済みの client・`redirect_uri` でなければエラー画面になる
+- `/account` のログインフォームは、クライアントのログインフォームとは別の CSRF Cookie を使う（別タブで開いているストアのログインを壊さない）
+- 画像のアップロード・削除は、サインイン状態に加えて CSRF トークン（サインイン Cookie に紐づけた HMAC）が必要。結果はすべて固定のコード付きで `/account` へリダイレクトし、URL の値をそのまま画面に出さない
+- 画像の種類はファイル名や Content-Type ではなく先頭のバイト列で判定し、PNG・JPEG・WebP 以外（SVG・HTML など）は受け付けない。デコードの前に縦横 4096 ピクセルを超えるものを拒否し、デコード・縮小・再エンコードした画像だけを保存する（[プロフィール画像](#プロフィール画像)）。リクエスト全体を `http.MaxBytesReader` で制限
 
 **認可コード**：サーバーに保存せず、`SESSION_SECRET` から作った鍵で暗号化（AES-GCM）した値をそのまま認可コードにしています。そのため複数インスタンスやサーバーレス（Vercel Functions）でも、別のインスタンスが発行したコードを交換できます。使用済みコードの記録はインスタンスごとのベストエフォートですが、再利用するには client secret と PKCE の verifier も必要です。
 
 **制約**：ログイン試行回数の制限は未実装です。
+
+## プロフィール画像
+
+ユーザーは `<ISSUER>/account` でプロフィール画像を登録・削除できます（PNG・JPEG・WebP、1MB 以下、4096×4096 ピクセル以下）。
+
+画像は ID サーバー自身の `idp` スキーマ（`idp.user_avatar` テーブル）にだけ保存します。ID サーバーが書き込むのはこのスキーマだけです。ストアの `User` テーブルには、書き込みも、外部キー・トリガーの追加もしません（読み取るだけです）。
+
+### クライアントから使う
+
+scope に `profile` を含めて認可すると、画像が登録されているユーザーの ID トークンと `/userinfo` に、OIDC 標準の `picture` クレームが入ります。未登録なら `picture` はありません。
+
+```text
+picture = <ISSUER>/avatars/<id>
+```
+
+- `<id>` は 128 ビットの乱数（base64url）で、アップロードのたびに変わります。`sub` からは推測できないので、画像を総当たりで集めることはできません
+- id が変われば URL も変わるため、`Cache-Control: public, max-age=31536000, immutable` で返します。クライアントは URL をそのまま `<img src>` に使えます
+- `Cross-Origin-Resource-Policy: cross-origin` を付けているので、別オリジンのページ（COEP を有効にしたページを含む）から `<img>` で表示できます。ほかに `X-Content-Type-Options: nosniff`、`Content-Security-Policy: default-src 'none'; sandbox`、`ETag` も付き、`If-None-Match` には 304 を返します
+- 存在しない id、差し替え・削除済みの id は 404
+- `picture` はサインイン時点の値です。画像を変えた後は、クライアントで再サインインするかトークンを取り直すと新しい URL になります
+- 画像の読み込みに失敗したとき（DB の障害やマイグレーション前など）は、サインインを止めずに `picture` を省きます（ログには ERROR を出します）。クライアントからは「画像なし」と区別できません
+
+Auth.js（candy-rain-stores）の OIDC プロバイダーは、既定の `profile()` で `picture` を `user.image` に入れます。
+
+### プライバシー
+
+- 画像は URL を知っていれば誰でも見られます。サインインしたすべてのクライアント（ストアなど）に `picture` として渡ります
+- アップロードされた画像はいったんデコードし、512×512 に収まるよう縮小して再エンコードしたものだけを保存・配信します（JPEG は品質 85 の JPEG、PNG・WebP は PNG）。JPEG の EXIF の向き（Orientation）は再エンコードの前に画素へ反映するので、スマートフォンの写真も正しい向きで表示されます。EXIF（撮影場所の GPS・機種・日時など）や、その他のメタデータは残りません。デコードできない画像は「画像を読み込めませんでした」で拒否します
+- 削除・差し替えた画像はサーバーからは配信されなくなりますが、ブラウザーや共有キャッシュに残ったコピーは最長 1 年残ることがあります（URL を知っている人のキャッシュに限られます）
+- 画像にはアップロード時のメールアドレスを記録し、現在の `User.email` と一致するときだけ表示します。ユーザー削除や開発 DB の作り直しで同じ id が別の人に再利用されても、前の人の画像は表示されません
+
+### マイグレーション（手動で一度だけ）
+
+`idp` スキーマと `idp.user_avatar` は起動時には作成しません。デプロイ前に [migrations/001_user_avatar.sql](migrations/001_user_avatar.sql) を `DATABASE_URL` と同じデータベースに適用してください（`IF NOT EXISTS` なので、二度実行しても壊れません）。
+
+```bash
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/001_user_avatar.sql
+```
+
+```sql
+CREATE SCHEMA IF NOT EXISTS idp;
+
+CREATE TABLE IF NOT EXISTS idp.user_avatar (
+  user_id      integer     PRIMARY KEY,
+  email        text        NOT NULL,
+  avatar_id    text        NOT NULL UNIQUE,
+  content_type text        NOT NULL,
+  data         bytea       NOT NULL,
+  updated_at   timestamptz NOT NULL DEFAULT now()
+);
+ALTER TABLE idp.user_avatar ENABLE ROW LEVEL SECURITY;
+```
+
+- `idp` スキーマは ID サーバーが所有します。candy-rain-store の Prisma は `public` スキーマだけを管理するので、`idp` は見えません（`prisma migrate dev` のドリフト検出や `prisma db push` の削除対象になりません）
+- `user_id` は `"User".id` ですが、外部キーにはしていません。`public` スキーマには何も作らないので、ストア側の `TRUNCATE`・`DROP`・`prisma migrate reset` にも影響しません。ユーザーを削除しても行は残りますが、メールアドレスが一致しないため表示されません（同じユーザーが画像を登録し直すと上書きされます）
+- Supabase では Data API（PostgREST）から見えないよう RLS を有効にし、ポリシーは作りません。ID サーバーはテーブル所有者のロール（Supabase の `postgres` など）で接続する前提です。別のロールで接続する場合は、`idp` スキーマの `USAGE` とテーブルの `SELECT, INSERT, UPDATE, DELETE` を付与したうえで、そのロールに `BYPASSRLS` を付けるか、そのロール用のポリシーを作ってください（権限の付与だけでは RLS により 0 行になります）
+- 適用前にデプロイしても、サインインは止まりません（`picture` が出ないだけ）。`/account` と `/avatars` はエラーになります
 
 ## ローカルで動かす
 
@@ -74,7 +139,13 @@ AUTH_CANDY_RAIN_ID_SECRET="<OIDC_CLIENT_SECRET と同じ値>"
 go test ./...
 ```
 
-Discovery・JWKS、ログインから ID トークン発行・userinfo までの一連の流れ、誤ったパスワード、コードの再利用、PKCE 不一致、未登録の `redirect_uri`、CSRF、SSO とログアウトを検証しています。
+Discovery・JWKS、ログインから ID トークン発行・userinfo までの一連の流れ、誤ったパスワード、コードの再利用、PKCE 不一致、未登録の `redirect_uri`、CSRF、SSO とログアウトを検証しています。プロフィール画像は、`picture` クレームの有無（画像ストアの障害時に省かれることを含む）、`/avatars` のヘッダーと 404、アップロードの検証（種類・サイズ・ピクセル数・壊れた画像・CSRF・別セッションのトークン・未サインイン）、EXIF の除去と縮小、削除、`/account` の未サインイン時のログインとオープンリダイレクト対策、別タブのストアのログインを壊さないことを検証しています。データベースは使わず、`user.Store` と `user.AvatarStore` をメモリ上の実装に差し替えています。
+
+`TEST_DATABASE_URL` を設定すると、実際の PostgreSQL でマイグレーション（2 回適用）と `PostgresAvatarStore` も検証します（`idp` スキーマに作成し、存在しない user_id の行だけを使います）。
+
+```bash
+TEST_DATABASE_URL=postgresql://user@localhost:5432/candyrain go test ./internal/user/
+```
 
 ## 環境変数
 

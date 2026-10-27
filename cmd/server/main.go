@@ -45,6 +45,7 @@ func run(logger *slog.Logger) error {
 		Issuer:        cfg.Issuer,
 		Clients:       cfg.Clients,
 		Users:         user.NewPostgresStore(pool),
+		Avatars:       user.NewPostgresAvatarStore(pool),
 		Signer:        oidc.NewSigner(cfg.SigningKey),
 		SessionSecret: cfg.SessionSecret,
 		LoginHint:     cfg.LoginHint,
