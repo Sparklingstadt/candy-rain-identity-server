@@ -162,22 +162,11 @@ func (s *Server) validAccountCSRF(r *http.Request) bool {
 }
 
 // accountUser returns the signed-in user. ok is false when the request has
-// no valid session or the user no longer exists; the caller then shows or
-// redirects to the login form.
+// no valid session, the user no longer exists or the password changed; the
+// caller then shows or redirects to the login form.
 func (s *Server) accountUser(w http.ResponseWriter, r *http.Request) (u user.User, ok bool, err error) {
-	sess, ok := s.currentSession(r)
-	if !ok {
-		return user.User{}, false, nil
-	}
-	u, err = s.opts.Users.FindByID(r.Context(), sess.UserID)
-	if errors.Is(err, user.ErrNotFound) {
-		http.SetCookie(w, s.cookie(sessionName, "", "/", -1))
-		return user.User{}, false, nil
-	}
-	if err != nil {
-		return user.User{}, false, err
-	}
-	return u, true, nil
+	_, u, ok, err = s.signedInUser(w, r)
+	return u, ok, err
 }
 
 func (s *Server) handleAccount(w http.ResponseWriter, r *http.Request) {

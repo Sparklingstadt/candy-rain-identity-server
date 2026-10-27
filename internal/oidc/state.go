@@ -109,6 +109,10 @@ type session struct {
 	UserID    int64
 	AuthTime  time.Time
 	ExpiresAt time.Time
+	// PasswordTag is passwordTag of the password hash at sign-in. When the
+	// password changes in candy-rain-store, the tag no longer matches and
+	// every session of that user ends, including stolen cookies.
+	PasswordTag string
 }
 
 func (c sessionCodec) mac(payload string) string {
@@ -117,11 +121,18 @@ func (c sessionCodec) mac(payload string) string {
 	return b64.EncodeToString(h.Sum(nil))
 }
 
+// passwordTag binds a session to a password hash without putting the hash
+// in the cookie. It is base64url, so it never contains the "." separator.
+func (c sessionCodec) passwordTag(passwordHash string) string {
+	return c.mac("session-password\x00" + passwordHash)
+}
+
 func (c sessionCodec) Encode(s session) string {
 	payload := strings.Join([]string{
 		strconv.FormatInt(s.UserID, 10),
 		strconv.FormatInt(s.AuthTime.Unix(), 10),
 		strconv.FormatInt(s.ExpiresAt.Unix(), 10),
+		s.PasswordTag,
 	}, ".")
 	return payload + "." + c.mac(payload)
 }
@@ -135,19 +146,24 @@ func (c sessionCodec) Decode(value string, now time.Time) (session, bool) {
 	if !hmac.Equal([]byte(sig), []byte(c.mac(payload))) {
 		return session{}, false
 	}
+	// Cookies from before PasswordTag existed have three parts and are
+	// rejected, so those users sign in once more.
 	parts := strings.Split(payload, ".")
-	if len(parts) != 3 {
+	if len(parts) != 4 || parts[3] == "" {
 		return session{}, false
 	}
 	var nums [3]int64
-	for i, p := range parts {
+	for i, p := range parts[:3] {
 		n, err := strconv.ParseInt(p, 10, 64)
 		if err != nil {
 			return session{}, false
 		}
 		nums[i] = n
 	}
-	s := session{UserID: nums[0], AuthTime: time.Unix(nums[1], 0), ExpiresAt: time.Unix(nums[2], 0)}
+	s := session{
+		UserID: nums[0], AuthTime: time.Unix(nums[1], 0), ExpiresAt: time.Unix(nums[2], 0),
+		PasswordTag: parts[3],
+	}
 	if !now.Before(s.ExpiresAt) {
 		return session{}, false
 	}

@@ -6,6 +6,7 @@ package oidc
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
 	"embed"
@@ -39,9 +40,17 @@ var templateFS embed.FS
 
 var pages = template.Must(template.ParseFS(templateFS, "templates/*.html"))
 
+// storeBcryptCost is the cost candy-rain-store hashes passwords with
+// (bcryptjs, cost 12). dummyHash must use the same cost: at a lower one, an
+// unknown email is rejected several times faster than a wrong password, which
+// tells whether an account exists.
+const storeBcryptCost = 12
+
 // dummyHash is compared against when the email is unknown, so a missing
-// account takes as long to reject as a wrong password.
-var dummyHash, _ = bcrypt.GenerateFromPassword([]byte("candy-rain-dummy-password"), bcrypt.DefaultCost)
+// account takes as long to reject as a wrong password. It is the hash of a
+// random password that was thrown away, precomputed so that startup does not
+// pay for a cost-12 hash.
+var dummyHash = []byte("$2a$12$lJH7Xl23lvnfhRG0LSeFsuxsSwt7TIV.z9o2esEx09m0ZNDoHz3IS")
 
 type Options struct {
 	Issuer        string
@@ -207,9 +216,17 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	if !s.validate(w, r, a) {
 		return
 	}
-	if sess, ok := s.currentSession(r); ok && a.Prompt != "login" {
-		s.issueCode(w, r, a, sess.UserID, sess.AuthTime)
-		return
+	if a.Prompt != "login" {
+		sess, _, ok, err := s.signedInUser(w, r)
+		if err != nil {
+			s.opts.Logger.Error("session user lookup failed", "err", err)
+			s.renderError(w, http.StatusInternalServerError, "サインインできませんでした。時間をおいてもう一度お試しください。")
+			return
+		}
+		if ok {
+			s.issueCode(w, r, a, sess.UserID, sess.AuthTime)
+			return
+		}
 	}
 	if a.Prompt == "none" {
 		s.redirectError(w, r, a, "login_required", "the user is not signed in")
@@ -286,6 +303,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	now := s.opts.Now()
 	http.SetCookie(w, s.cookie(sessionName, s.sessions.Encode(session{
 		UserID: u.ID, AuthTime: now, ExpiresAt: now.Add(sessionTTL),
+		PasswordTag: s.sessions.passwordTag(u.PasswordHash),
 	}), "/", int(sessionTTL.Seconds())))
 	s.opts.Logger.Info("signed in", "sub", u.Subject())
 	if form.Account {
@@ -315,12 +333,28 @@ func (s *Server) authenticate(ctx context.Context, email, password string) (user
 	return u, nil
 }
 
-func (s *Server) currentSession(r *http.Request) (session, bool) {
+// signedInUser returns the session and its user. ok is false when the
+// request has no valid session, the user no longer exists, or the password
+// changed since sign-in; the session cookie is then cleared. err is set only
+// when the lookup failed.
+func (s *Server) signedInUser(w http.ResponseWriter, r *http.Request) (sess session, u user.User, ok bool, err error) {
 	c, err := r.Cookie(sessionName)
 	if err != nil {
-		return session{}, false
+		return session{}, user.User{}, false, nil
 	}
-	return s.sessions.Decode(c.Value, s.opts.Now())
+	sess, ok = s.sessions.Decode(c.Value, s.opts.Now())
+	if !ok {
+		return session{}, user.User{}, false, nil
+	}
+	u, err = s.opts.Users.FindByID(r.Context(), sess.UserID)
+	if err != nil && !errors.Is(err, user.ErrNotFound) {
+		return session{}, user.User{}, false, err
+	}
+	if err != nil || !hmac.Equal([]byte(sess.PasswordTag), []byte(s.sessions.passwordTag(u.PasswordHash))) {
+		http.SetCookie(w, s.cookie(sessionName, "", "/", -1))
+		return session{}, user.User{}, false, nil
+	}
+	return sess, u, true, nil
 }
 
 func (s *Server) issueCode(w http.ResponseWriter, r *http.Request, a authRequest, userID int64, authTime time.Time) {

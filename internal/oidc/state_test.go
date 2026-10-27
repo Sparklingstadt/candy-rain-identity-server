@@ -1,6 +1,7 @@
 package oidc
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -42,5 +43,24 @@ func TestCodeRejectsTamperingExpiryAndOtherSecrets(t *testing.T) {
 	}
 	if _, ok := store.Redeem("not-a-code", now); ok {
 		t.Error("garbage must be rejected")
+	}
+}
+
+func TestSessionKeepsPasswordTagAndRejectsOldCookies(t *testing.T) {
+	c := sessionCodec{secret: []byte(strings.Repeat("s", 32))}
+	now := time.Now()
+	tag := c.passwordTag("$2a$12$hash")
+	s, ok := c.Decode(c.Encode(session{UserID: 7, AuthTime: now, ExpiresAt: now.Add(time.Hour), PasswordTag: tag}), now)
+	if !ok || s.UserID != 7 || s.PasswordTag != tag {
+		t.Fatalf("round trip: %v %v", ok, s)
+	}
+	if c.passwordTag("$2a$12$other") == tag {
+		t.Fatal("different hashes must give different tags")
+	}
+
+	// A correctly signed cookie in the format without PasswordTag.
+	payload := "7." + strconv.FormatInt(now.Unix(), 10) + "." + strconv.FormatInt(now.Add(time.Hour).Unix(), 10)
+	if _, ok := c.Decode(payload+"."+c.mac(payload), now); ok {
+		t.Fatal("a cookie without a password tag must be rejected")
 	}
 }
