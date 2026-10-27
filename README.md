@@ -11,7 +11,7 @@
    │                          │
    │ ②/authorize へリダイレクト（PKCE S256）
    ▼                          │
-Candy Rain ID ─③メール・パスワード照合─▶ PostgreSQL "User" テーブル（ストアと共有・読み取りのみ）
+Candy Rain ID ─③メール・パスワード照合─▶ PostgreSQL "User" テーブル（ストアと共有・専用ロールで読み取りのみ）
    │                          │
    │ ④認可コードを付けてストアへ戻す
    ▼                          ▼
@@ -54,7 +54,11 @@ candy-rain-store ──⑤/token でコードを ID トークンに交換（clie
 
 **認可コード**：サーバーに保存せず、`SESSION_SECRET` から作った鍵で暗号化（AES-GCM）した値をそのまま認可コードにしています。そのため複数インスタンスやサーバーレス（Vercel Functions）でも、別のインスタンスが発行したコードを交換できます。使用済みコードの記録はインスタンスごとのベストエフォートですが、再利用するには client secret と PKCE の verifier も必要です。
 
-**制約**：ログイン試行回数の制限は未実装です。
+**ログイン試行回数の制限**：サインインの失敗をメールアドレスごと・IP アドレスごとに数え、最初の失敗から 15 分のあいだに、同じメールアドレスで 10 回、同じ IP アドレスで 50 回失敗すると、その区間が終わるまでサインインを断ります（429。正しいパスワードでも通しません）。存在しないメールアドレスも同じように数えるので、断られたかどうかからアカウントの有無は分かりません。成功するとそのメールアドレスの回数は消えますが、IP アドレスの回数は残します（自分のアカウントでのサインインを挟んで回数を消せないように）。Vercel では複数インスタンスが動くため、回数は DB の `idp.login_failure`（[migrations/002_login_failure.sql](migrations/002_login_failure.sql)）で数えます。IP アドレスは Vercel 上では Vercel が上書きする `X-Real-IP` から、それ以外では接続元から取ります（`CLIENT_IP_HEADER` で変更可）。テーブルが読めないときはエラーログを出してサインインは通します（マイグレーション前のデプロイでサインインを止めないため）。
+
+制限には、攻撃者が他人のメールアドレスで失敗を重ねると、その人が 15 分間サインインできなくなるという副作用があります。一般的なトレードオフとして受け入れています。
+
+**DB の権限**：ID サーバーは専用ロール `idp_server`（[migrations/003_idp_server_role.sql](migrations/003_idp_server_role.sql)）で接続します。このロールは `"User"` のうちサインインに使う列（id・email・passwordHash・firstName・lastName・role）を読めるだけで、書き込みはできません。そのため ID サーバーが侵害されても、注文・ロール・パスワードハッシュは書き換えられません。読み書きできるのは `idp` スキーマだけです。起動時に `"User"` を書き換えられるロールで接続していると、警告ログを出します。
 
 ## プロフィール画像
 
@@ -88,7 +92,19 @@ Auth.js（candy-rain-stores）の OIDC プロバイダーは、既定の `profil
 
 ### マイグレーション（手動で一度だけ）
 
-`idp` スキーマと `idp.user_avatar` は起動時には作成しません。デプロイ前に [migrations/001_user_avatar.sql](migrations/001_user_avatar.sql) を `DATABASE_URL` と同じデータベースに適用してください（`IF NOT EXISTS` なので、二度実行しても壊れません）。開発中の古い版（外部キー付きや `etag` 列のもの）を適用済みのデータベースでは、マイグレーションがエラーで止まります。その場合は `DROP TABLE idp.user_avatar;`（と、あれば `DROP TABLE public.idp_user_avatar;`）を実行してから適用し直してください。
+マイグレーションは 3 つあり、どれも起動時には適用されません。テーブル所有者のロール（Supabase なら `postgres`）で、`migrations/` の番号順に適用してください（どれも再実行しても壊れません）。
+
+```bash
+psql "$OWNER_DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/001_user_avatar.sql
+psql "$OWNER_DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/002_login_failure.sql
+read -rs IDP_SERVER_PASSWORD   # openssl rand -base64 32 などで作った値を貼り付ける
+psql "$OWNER_DATABASE_URL" -v ON_ERROR_STOP=1 -v idp_server_password="$IDP_SERVER_PASSWORD" \
+  -f migrations/003_idp_server_role.sql
+```
+
+003 のあと、ID サーバーの `DATABASE_URL` のユーザーとパスワードを `idp_server` のものに替えます（Supabase の接続プーラー経由なら、ユーザー名は `idp_server.<プロジェクト ref>`）。003 を再実行すると `idp_server` のパスワードを更新します。今後 `idp` にテーブルを足すときは、003 末尾のポリシーの一覧にも足してください。
+
+以下は 001（プロフィール画像）についての補足です。`idp` スキーマと `idp.user_avatar` は起動時には作成しません。デプロイ前に [migrations/001_user_avatar.sql](migrations/001_user_avatar.sql) を `DATABASE_URL` と同じデータベースに適用してください（`IF NOT EXISTS` なので、二度実行しても壊れません）。開発中の古い版（外部キー付きや `etag` 列のもの）を適用済みのデータベースでは、マイグレーションがエラーで止まります。その場合は `DROP TABLE idp.user_avatar;`（と、あれば `DROP TABLE public.idp_user_avatar;`）を実行してから適用し直してください。
 
 ```bash
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/001_user_avatar.sql
@@ -142,10 +158,14 @@ go test ./...
 
 Discovery・JWKS、ログインから ID トークン発行・userinfo までの一連の流れ、誤ったパスワード、コードの再利用、PKCE 不一致、未登録の `redirect_uri`、CSRF、SSO とログアウト、パスワード変更によるサインイン状態の無効化、ダミーハッシュの cost を検証しています。プロフィール画像は、`picture` クレームの有無（画像ストアの障害時に省かれることを含む）、`/avatars` のヘッダーと 404、アップロードの検証（種類・サイズ・ピクセル数・壊れた画像・CSRF・別セッションのトークン・未サインイン）、EXIF の除去と縮小、削除、`/account` の未サインイン時のログインとオープンリダイレクト対策、別タブのストアのログインを壊さないことを検証しています。データベースは使わず、`user.Store` と `user.AvatarStore` をメモリ上の実装に差し替えています。
 
-`TEST_DATABASE_URL` を設定すると、実際の PostgreSQL でマイグレーション（2 回適用）と `PostgresAvatarStore` も検証します（`idp` スキーマに作成し、存在しない user_id の行だけを使います）。
+ログイン試行回数の制限は、メールアドレス・IP アドレスごとの上限、存在しないメールアドレスの扱い、成功時のリセット、DB 障害時にサインインを止めないこと、IP アドレスの取り方を検証しています。
+
+`TEST_DATABASE_URL` を設定すると、実際の PostgreSQL でマイグレーション 001・002（それぞれ 2 回適用）、`PostgresAvatarStore`、`loginlimit.PostgresStore` も検証します（`idp` スキーマに作成し、存在しない user_id や実際には使われないキーの行だけを使います）。テーブル所有者のロールで接続してください。`TEST_IDP_SERVER_DATABASE_URL` に `idp_server` ロールの接続先を設定すると、そのロールが `"User"` を読めて書き換えられないことも検証します。
 
 ```bash
-TEST_DATABASE_URL=postgresql://user@localhost:5432/candyrain go test ./internal/user/
+TEST_DATABASE_URL=postgresql://user@localhost:5432/candyrain \
+TEST_IDP_SERVER_DATABASE_URL=postgresql://idp_server:<パスワード>@localhost:5432/candyrain \
+  go test ./internal/...
 ```
 
 ## 環境変数
@@ -153,7 +173,7 @@ TEST_DATABASE_URL=postgresql://user@localhost:5432/candyrain go test ./internal/
 | 変数 | 必須 | 内容 |
 | --- | --- | --- |
 | `ISSUER` | ○ | 公開 URL（末尾スラッシュなし） |
-| `DATABASE_URL` | ○ | ストアと同じ PostgreSQL |
+| `DATABASE_URL` | ○ | ストアと同じ PostgreSQL。ユーザーは専用ロール `idp_server`（[マイグレーション](#マイグレーション手動で一度だけ)） |
 | `OIDC_CLIENTS` | ※ | 複数のクライアント（JSON 配列。[下記](#複数のクライアントを登録する)） |
 | `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` | ※ | クライアントを 1 つだけ登録するときの書き方 |
 | `OIDC_REDIRECT_URIS` | ※ | `<ストア>/api/auth/callback/candy-rain-id`（カンマ区切り） |
@@ -162,6 +182,7 @@ TEST_DATABASE_URL=postgresql://user@localhost:5432/candyrain go test ./internal/
 | `SESSION_SECRET` | 本番 ○ | 32 文字以上。未設定時は起動ごとに生成 |
 | `PORT` / `ADDR` | | 既定は `:8080` |
 | `LOGIN_HINT` | | ログイン画面に表示する補足 |
+| `CLIENT_IP_HEADER` | | クライアントの IP アドレスが入るヘッダー（ログイン試行回数の制限に使う）。Vercel 上の既定は `X-Real-IP`、それ以外の既定は接続元。前段のプロキシが上書きするヘッダーだけを指定する |
 
 ※ `OIDC_CLIENTS` か `OIDC_CLIENT_ID` 系のどちらかで、少なくとも 1 つのクライアントが必要です。
 

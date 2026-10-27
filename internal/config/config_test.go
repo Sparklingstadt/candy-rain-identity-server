@@ -69,3 +69,20 @@ func TestLoadClients(t *testing.T) {
 		})
 	}
 }
+
+func TestClientIPHeader(t *testing.T) {
+	for _, tc := range []struct {
+		vercel, header, want string
+	}{
+		{"", "", ""},
+		{"1", "", "X-Real-IP"},
+		{"1", "CF-Connecting-IP", "CF-Connecting-IP"},
+		{"", "X-Forwarded-For", "X-Forwarded-For"},
+	} {
+		t.Setenv("VERCEL", tc.vercel)
+		t.Setenv("CLIENT_IP_HEADER", tc.header)
+		if got := clientIPHeader(); got != tc.want {
+			t.Errorf("VERCEL=%q CLIENT_IP_HEADER=%q: got %q, want %q", tc.vercel, tc.header, got, tc.want)
+		}
+	}
+}

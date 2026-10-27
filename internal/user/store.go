@@ -75,3 +75,14 @@ func (s *PostgresStore) queryOne(ctx context.Context, sql string, arg any) (User
 	}
 	return u, err
 }
+
+// CanModifyUsers reports whether the connected role could change the "User"
+// table. The identity server only reads it, so a true result means it runs
+// with more privilege than it needs (see migrations/003_idp_server_role.sql).
+func (s *PostgresStore) CanModifyUsers(ctx context.Context) (bool, error) {
+	var ok bool
+	err := s.pool.QueryRow(ctx,
+		`SELECT has_table_privilege(current_user, 'public."User"', 'INSERT, UPDATE, DELETE, TRUNCATE')`,
+	).Scan(&ok)
+	return ok, err
+}

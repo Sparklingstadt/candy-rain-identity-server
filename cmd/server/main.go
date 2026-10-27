@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Sparklingstadt/candy-rain-identity-server/internal/config"
+	"github.com/Sparklingstadt/candy-rain-identity-server/internal/loginlimit"
 	"github.com/Sparklingstadt/candy-rain-identity-server/internal/oidc"
 	"github.com/Sparklingstadt/candy-rain-identity-server/internal/user"
 )
@@ -41,15 +42,21 @@ func run(logger *slog.Logger) error {
 	}
 	defer pool.Close()
 
+	users := user.NewPostgresStore(pool)
+	warnIfOverprivileged(ctx, logger, users)
+
 	handler := oidc.New(oidc.Options{
 		Issuer:        cfg.Issuer,
 		Clients:       cfg.Clients,
-		Users:         user.NewPostgresStore(pool),
+		Users:         users,
 		Avatars:       user.NewPostgresAvatarStore(pool),
 		Signer:        oidc.NewSigner(cfg.SigningKey),
 		SessionSecret: cfg.SessionSecret,
 		LoginHint:     cfg.LoginHint,
 		Logger:        logger,
+
+		LoginFailures:  loginlimit.NewPostgresStore(pool),
+		ClientIPHeader: cfg.ClientIPHeader,
 	})
 
 	srv := &http.Server{
@@ -77,4 +84,19 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	return nil
+}
+
+// warnIfOverprivileged logs when the database role can write the store's
+// "User" table. It never stops startup: the check only points at a setting
+// to tighten.
+func warnIfOverprivileged(ctx context.Context, logger *slog.Logger, users *user.PostgresStore) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	writable, err := users.CanModifyUsers(ctx)
+	switch {
+	case err != nil:
+		logger.Warn("could not check the database role's privileges", "err", err)
+	case writable:
+		logger.Warn(`the database role can modify "User"; connect as the read-only idp_server role (migrations/003_idp_server_role.sql)`)
+	}
 }
