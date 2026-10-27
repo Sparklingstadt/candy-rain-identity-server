@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -15,10 +16,10 @@ import (
 )
 
 type Client struct {
-	ID                     string
-	Secret                 string
-	RedirectURIs           []string
-	PostLogoutRedirectURIs []string
+	ID                     string   `json:"id"`
+	Secret                 string   `json:"secret"`
+	RedirectURIs           []string `json:"redirect_uris"`
+	PostLogoutRedirectURIs []string `json:"post_logout_redirect_uris"`
 }
 
 type Config struct {
@@ -27,7 +28,7 @@ type Config struct {
 	DatabaseURL   string
 	SigningKey    *rsa.PrivateKey
 	SessionSecret []byte
-	Client        Client
+	Clients       []Client
 	// LoginHint is shown under the login form, e.g. the demo account.
 	LoginHint string
 }
@@ -41,12 +42,6 @@ func Load(logger *slog.Logger) (Config, error) {
 		Issuer:      strings.TrimRight(os.Getenv("ISSUER"), "/"),
 		DatabaseURL: os.Getenv("DATABASE_URL"),
 		LoginHint:   os.Getenv("LOGIN_HINT"),
-		Client: Client{
-			ID:                     os.Getenv("OIDC_CLIENT_ID"),
-			Secret:                 os.Getenv("OIDC_CLIENT_SECRET"),
-			RedirectURIs:           splitList(os.Getenv("OIDC_REDIRECT_URIS")),
-			PostLogoutRedirectURIs: splitList(os.Getenv("OIDC_POST_LOGOUT_REDIRECT_URIS")),
-		},
 	}
 
 	var errs []error
@@ -58,12 +53,11 @@ func Load(logger *slog.Logger) (Config, error) {
 	if cfg.DatabaseURL == "" {
 		errs = append(errs, errors.New("DATABASE_URL is required"))
 	}
-	if cfg.Client.ID == "" || cfg.Client.Secret == "" {
-		errs = append(errs, errors.New("OIDC_CLIENT_ID and OIDC_CLIENT_SECRET are required"))
+	clients, err := loadClients()
+	if err != nil {
+		errs = append(errs, err)
 	}
-	if len(cfg.Client.RedirectURIs) == 0 {
-		errs = append(errs, errors.New("OIDC_REDIRECT_URIS is required"))
-	}
+	cfg.Clients = clients
 
 	// On Vercel every instance would generate its own key and secret, so
 	// tokens, codes and sessions issued by one would fail on another.
@@ -100,6 +94,58 @@ func Load(logger *slog.Logger) (Config, error) {
 	}
 
 	return cfg, errors.Join(errs...)
+}
+
+// loadClients reads the clients from OIDC_CLIENTS (a JSON array) and from
+// the single-client OIDC_CLIENT_ID / OIDC_CLIENT_SECRET / OIDC_REDIRECT_URIS /
+// OIDC_POST_LOGOUT_REDIRECT_URIS variables. Both may be set; the single
+// client is registered alongside the ones in OIDC_CLIENTS.
+func loadClients() ([]Client, error) {
+	var clients []Client
+	if raw := strings.TrimSpace(os.Getenv("OIDC_CLIENTS")); raw != "" {
+		dec := json.NewDecoder(strings.NewReader(raw))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&clients); err != nil {
+			return nil, fmt.Errorf("OIDC_CLIENTS must be a JSON array of clients: %w", err)
+		}
+	}
+	single := Client{
+		ID:                     os.Getenv("OIDC_CLIENT_ID"),
+		Secret:                 os.Getenv("OIDC_CLIENT_SECRET"),
+		RedirectURIs:           splitList(os.Getenv("OIDC_REDIRECT_URIS")),
+		PostLogoutRedirectURIs: splitList(os.Getenv("OIDC_POST_LOGOUT_REDIRECT_URIS")),
+	}
+	if single.ID != "" || single.Secret != "" || len(single.RedirectURIs) > 0 {
+		clients = append(clients, single)
+	}
+	return clients, ValidateClients(clients)
+}
+
+// ValidateClients checks that every client can complete the flow and that
+// client IDs are unique.
+func ValidateClients(clients []Client) error {
+	if len(clients) == 0 {
+		return errors.New("register at least one client with OIDC_CLIENTS or OIDC_CLIENT_ID")
+	}
+	var errs []error
+	seen := map[string]bool{}
+	for i, c := range clients {
+		name := c.ID
+		if name == "" {
+			name = fmt.Sprintf("#%d", i+1)
+		}
+		if c.ID == "" || c.Secret == "" {
+			errs = append(errs, fmt.Errorf("client %s: id and secret are required", name))
+		}
+		if len(c.RedirectURIs) == 0 {
+			errs = append(errs, fmt.Errorf("client %s: at least one redirect URI is required", name))
+		}
+		if c.ID != "" && seen[c.ID] {
+			errs = append(errs, fmt.Errorf("client %s is registered more than once", c.ID))
+		}
+		seen[c.ID] = true
+	}
+	return errors.Join(errs...)
 }
 
 // ParseRSAPrivateKey accepts PKCS#1 ("RSA PRIVATE KEY") and PKCS#8 ("PRIVATE KEY") PEM.

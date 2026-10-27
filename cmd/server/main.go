@@ -43,7 +43,7 @@ func run(logger *slog.Logger) error {
 
 	handler := oidc.New(oidc.Options{
 		Issuer:        cfg.Issuer,
-		Client:        cfg.Client,
+		Clients:       cfg.Clients,
 		Users:         user.NewPostgresStore(pool),
 		Signer:        oidc.NewSigner(cfg.SigningKey),
 		SessionSecret: cfg.SessionSecret,

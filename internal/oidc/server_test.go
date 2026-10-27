@@ -28,6 +28,12 @@ const (
 	redirectURI  = "http://store.test/api/auth/callback/candy-rain-id"
 	logoutURI    = "http://store.test/signout"
 	password     = "demo-password"
+
+	// A second client, so tests can check that clients stay separate.
+	storesClientID     = "candy-rain-stores"
+	storesClientSecret = "stores-secret"
+	storesRedirectURI  = "http://stores.test/api/auth/callback/candy-rain-id"
+	storesLogoutURI    = "http://stores.test/"
 )
 
 type fakeStore struct{ users []user.User }
@@ -73,10 +79,13 @@ func newHarness(t *testing.T) *harness {
 	issuer := "http://" + h.ts.Listener.Addr().String()
 	h.ts.Config.Handler = New(Options{
 		Issuer: issuer,
-		Client: config.Client{
+		Clients: []config.Client{{
 			ID: clientID, Secret: clientSecret,
 			RedirectURIs: []string{redirectURI}, PostLogoutRedirectURIs: []string{logoutURI},
-		},
+		}, {
+			ID: storesClientID, Secret: storesClientSecret,
+			RedirectURIs: []string{storesRedirectURI}, PostLogoutRedirectURIs: []string{storesLogoutURI},
+		}},
 		Users:         store,
 		Signer:        signer,
 		SessionSecret: []byte(strings.Repeat("s", 32)),
@@ -99,6 +108,14 @@ func pkcePair() (verifier, challenge string) {
 	verifier = strings.Repeat("v", 50)
 	sum := sha256.Sum256([]byte(verifier))
 	return verifier, b64.EncodeToString(sum[:])
+}
+
+// storesAuthorizeQuery is authorizeQuery for the second client.
+func storesAuthorizeQuery(challenge string) url.Values {
+	q := authorizeQuery(challenge)
+	q.Set("client_id", storesClientID)
+	q.Set("redirect_uri", storesRedirectURI)
+	return q
 }
 
 func authorizeQuery(challenge string) url.Values {
@@ -148,6 +165,12 @@ func (h *harness) login(q url.Values, email, pass string) *http.Response {
 
 func codeFrom(t *testing.T, res *http.Response) string {
 	t.Helper()
+	return codeAt(t, res, redirectURI)
+}
+
+// codeAt reads the code from a redirect that must go to redirectTo.
+func codeAt(t *testing.T, res *http.Response, redirectTo string) string {
+	t.Helper()
 	if res.StatusCode != http.StatusSeeOther {
 		t.Fatalf("expected redirect to the store, got %d", res.StatusCode)
 	}
@@ -155,7 +178,7 @@ func codeFrom(t *testing.T, res *http.Response) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := loc.Scheme + "://" + loc.Host + loc.Path; got != redirectURI {
+	if got := loc.Scheme + "://" + loc.Host + loc.Path; got != redirectTo {
 		t.Fatalf("redirected to %s", got)
 	}
 	if loc.Query().Get("state") != "state-123" {
@@ -170,14 +193,19 @@ func codeFrom(t *testing.T, res *http.Response) string {
 
 func (h *harness) exchange(code, verifier string) (*http.Response, map[string]any) {
 	h.t.Helper()
+	return h.exchangeAs(clientID, clientSecret, redirectURI, code, verifier)
+}
+
+func (h *harness) exchangeAs(id, secret, redirectTo, code, verifier string) (*http.Response, map[string]any) {
+	h.t.Helper()
 	req, _ := http.NewRequest(http.MethodPost, h.issuer()+"/token", strings.NewReader(url.Values{
 		"grant_type":    {"authorization_code"},
 		"code":          {code},
-		"redirect_uri":  {redirectURI},
+		"redirect_uri":  {redirectTo},
 		"code_verifier": {verifier},
 	}.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.SetBasicAuth(clientID, clientSecret)
+	req.SetBasicAuth(id, secret)
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		h.t.Fatal(err)
@@ -376,5 +404,89 @@ func TestSessionSkipsFormUntilLogout(t *testing.T) {
 	res.Body.Close()
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("after logout the form should show again, got %d", res.StatusCode)
+	}
+}
+
+func TestSecondClientSignsInWithSharedSession(t *testing.T) {
+	h := newHarness(t)
+	verifier, challenge := pkcePair()
+	code := codeAt(t, h.login(storesAuthorizeQuery(challenge), "user1@mail.com", password), storesRedirectURI)
+
+	res, tokens := h.exchangeAs(storesClientID, storesClientSecret, storesRedirectURI, code, verifier)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("token: status %d %v", res.StatusCode, tokens)
+	}
+	claims, err := h.signer.Verify(tokens["id_token"].(string), "JWT", time.Now())
+	if err != nil {
+		t.Fatalf("id_token does not verify: %v", err)
+	}
+	if claims["aud"] != storesClientID || claims["sub"] != "1" {
+		t.Fatalf("id_token aud %v sub %v", claims["aud"], claims["sub"])
+	}
+
+	// Signed in through one client, the other gets a code without the form.
+	res, err = h.client.Get(h.issuer() + "/authorize?" + authorizeQuery(challenge).Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	codeFrom(t, res)
+}
+
+func TestClientsCannotUseEachOthersCodesOrRedirects(t *testing.T) {
+	h := newHarness(t)
+	verifier, challenge := pkcePair()
+
+	// A code issued to candy-rain-store cannot be redeemed by candy-rain-stores.
+	code := codeFrom(t, h.login(authorizeQuery(challenge), "user1@mail.com", password))
+	for _, redirectTo := range []string{redirectURI, storesRedirectURI} {
+		res, body := h.exchangeAs(storesClientID, storesClientSecret, redirectTo, code, verifier)
+		if res.StatusCode != http.StatusBadRequest || body["error"] != "invalid_grant" {
+			t.Fatalf("other client's code via %s: %d %v", redirectTo, res.StatusCode, body)
+		}
+	}
+
+	// One client's secret does not authenticate the other.
+	if res, body := h.exchangeAs(storesClientID, clientSecret, storesRedirectURI, code, verifier); res.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("other client's secret: %d %v", res.StatusCode, body)
+	}
+
+	// A redirect URI registered for one client is not accepted for the other.
+	q := authorizeQuery(challenge)
+	q.Set("redirect_uri", storesRedirectURI)
+	res, err := h.client.Get(h.issuer() + "/authorize?" + q.Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusBadRequest || res.Header.Get("Location") != "" {
+		t.Fatalf("other client's redirect_uri: %d %q", res.StatusCode, res.Header.Get("Location"))
+	}
+}
+
+func TestLogoutRedirectIsCheckedAgainstTheNamedClient(t *testing.T) {
+	h := newHarness(t)
+	for _, tc := range []struct {
+		clientID, target string
+		follow           bool
+	}{
+		{storesClientID, storesLogoutURI, true},
+		{"", storesLogoutURI, true},
+		{clientID, storesLogoutURI, false},
+		{"unknown", logoutURI, false},
+	} {
+		q := url.Values{"post_logout_redirect_uri": {tc.target}}
+		if tc.clientID != "" {
+			q.Set("client_id", tc.clientID)
+		}
+		res, err := h.client.Get(h.issuer() + "/logout?" + q.Encode())
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		followed := res.StatusCode == http.StatusFound && res.Header.Get("Location") == tc.target
+		if followed != tc.follow {
+			t.Errorf("client_id=%q target=%s: status %d location %q", tc.clientID, tc.target, res.StatusCode, res.Header.Get("Location"))
+		}
 	}
 }

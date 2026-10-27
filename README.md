@@ -1,6 +1,6 @@
 # Candy Rain ID（candy-rain-identity-server）
 
-[Candy Rain Store](https://github.com/Sparklingstadt/candy-rain-store) 向けの認証サーバーです。Go で書いた小さな **OpenID Connect プロバイダー**で、ストアは「Candy Rain ID でサインイン」からこのサーバーを経由してログインします。
+[Candy Rain Store](https://github.com/Sparklingstadt/candy-rain-store) や [Candy Rain Stores](https://github.com/Sparklingstadt/candy-rain-stores) 向けの認証サーバーです。Go で書いた小さな **OpenID Connect プロバイダー**で、各サービスは「Candy Rain ID でサインイン」からこのサーバーを経由してログインします。
 
 ![ログイン画面](docs/idp-login.png)
 
@@ -18,10 +18,10 @@ Candy Rain ID ─③メール・パスワード照合─▶ PostgreSQL "User" �
 candy-rain-store ──⑤/token でコードを ID トークンに交換（client_secret_basic）
 ```
 
-- **認可コードフロー + PKCE（S256 必須）**。対応する client は 1 つ（candy-rain-store）
+- **認可コードフロー + PKCE（S256 必須）**。client は複数登録でき、それぞれに client secret・`redirect_uri`・ログアウト後の戻り先を持たせます（[複数のクライアントを登録する](#複数のクライアントを登録する)）
 - ユーザーはストアの PostgreSQL の `User` テーブルを **そのまま参照**し、bcrypt でパスワードを照合します。ユーザー移行は不要で、スキーマとマイグレーションの管理はストア側のままです
 - ID トークンの `sub` はストアの `User.id` なので、カート・注文はそのまま引き継がれます。`role`（`CUSTOMER` / `ADMIN`）も返すため、管理画面の権限判定も変わりません
-- ID サーバー自身のサインイン状態（Cookie, 8 時間）を持つので、再ログイン時はパスワード入力を省略します（SSO）。ストアでサインアウトすると `/logout` でこの状態も消えます
+- ID サーバー自身のサインイン状態（Cookie, 8 時間）を持つので、再ログイン時はパスワード入力を省略します（SSO）。このサインイン状態はクライアント間で共有されるため、ストアでログインした後は Candy Rain Stores にもパスワードなしでログインできます。どれかのサービスでサインアウトすると `/logout` でこの状態も消えます
 
 ## エンドポイント
 
@@ -37,8 +37,8 @@ candy-rain-store ──⑤/token でコードを ID トークンに交換（clie
 
 ## セキュリティ上の配慮
 
-- `redirect_uri` は登録済みのものと完全一致のみ。一致しないときはリダイレクトせずエラー画面を出す（オープンリダイレクト対策）
-- 認可コードは 60 秒・1 回限り。PKCE の検証に失敗したら `invalid_grant`
+- `redirect_uri` は、その client に登録したものと完全一致のみ（別の client の URI は使えない）。一致しないときはリダイレクトせずエラー画面を出す（オープンリダイレクト対策）
+- 認可コードは 60 秒・1 回限りで、発行先の client しか交換できない。PKCE の検証に失敗したら `invalid_grant`
 - ログインフォームは CSRF トークン（ダブルサブミット Cookie）で保護
 - 存在しないメールアドレスでもダミーハッシュで bcrypt 照合を行い、応答時間からアカウントの有無を推測されにくくする
 - client secret・PKCE の比較は定数時間。Cookie は `HttpOnly` / `SameSite=Lax`、`ISSUER` が https のときは `Secure`
@@ -82,13 +82,33 @@ Discovery・JWKS、ログインから ID トークン発行・userinfo までの
 | --- | --- | --- |
 | `ISSUER` | ○ | 公開 URL（末尾スラッシュなし） |
 | `DATABASE_URL` | ○ | ストアと同じ PostgreSQL |
-| `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` | ○ | ストアに渡すクライアント情報 |
-| `OIDC_REDIRECT_URIS` | ○ | `<ストア>/api/auth/callback/candy-rain-id`（カンマ区切り） |
+| `OIDC_CLIENTS` | ※ | 複数のクライアント（JSON 配列。[下記](#複数のクライアントを登録する)） |
+| `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` | ※ | クライアントを 1 つだけ登録するときの書き方 |
+| `OIDC_REDIRECT_URIS` | ※ | `<ストア>/api/auth/callback/candy-rain-id`（カンマ区切り） |
 | `OIDC_POST_LOGOUT_REDIRECT_URIS` | | `<ストア>/signout` |
 | `SIGNING_KEY_PEM` | 本番 ○ | RSA 秘密鍵（PKCS#1 / PKCS#8）。未設定時は起動ごとに生成 |
 | `SESSION_SECRET` | 本番 ○ | 32 文字以上。未設定時は起動ごとに生成 |
 | `PORT` / `ADDR` | | 既定は `:8080` |
 | `LOGIN_HINT` | | ログイン画面に表示する補足 |
+
+※ `OIDC_CLIENTS` か `OIDC_CLIENT_ID` 系のどちらかで、少なくとも 1 つのクライアントが必要です。
+
+### 複数のクライアントを登録する
+
+`OIDC_CLIENTS` に JSON 配列で書きます。`OIDC_CLIENT_ID` 系の変数と併用でき、その場合は両方のクライアントが登録されます（既存の candy-rain-store の設定はそのままで、Candy Rain Stores を `OIDC_CLIENTS` に足せます）。client ID が重複していたり、secret・`redirect_uris` が欠けていたりすると起動しません。
+
+```bash
+OIDC_CLIENTS='[
+  {
+    "id": "candy-rain-stores",
+    "secret": "<openssl rand -base64 32>",
+    "redirect_uris": ["http://localhost:3001/api/auth/callback/candy-rain-id"],
+    "post_logout_redirect_uris": ["http://localhost:3001/"]
+  }
+]'
+```
+
+`/logout` に `client_id` を付けると、`post_logout_redirect_uri` はその client に登録したものだけが許可されます。付けない場合はいずれかの client に登録されていれば許可されます。
 
 ## デプロイ
 
