@@ -66,6 +66,15 @@ type harness struct {
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
+	avatars := user.NewMemoryAvatarStore()
+	h := newHarnessWith(t, avatars)
+	h.avatars = avatars
+	return h
+}
+
+// newHarnessWith runs the server on any avatar store, e.g. a failing one.
+func newHarnessWith(t *testing.T, avatars user.AvatarStore) *harness {
+	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatal(err)
@@ -73,9 +82,10 @@ func newHarness(t *testing.T) *harness {
 	hash, _ := bcrypt.GenerateFromPassword([]byte(password), bcrypt.MinCost)
 	store := fakeStore{users: []user.User{
 		{ID: 1, Email: "user1@mail.com", PasswordHash: string(hash), FirstName: "花子", LastName: "雨宮", Role: "CUSTOMER"},
+		{ID: 2, Email: "user2@mail.com", PasswordHash: string(hash), FirstName: "太郎", LastName: "晴山", Role: "CUSTOMER"},
 	}}
 	signer := NewSigner(key)
-	h := &harness{t: t, signer: signer, avatars: user.NewMemoryAvatarStore()}
+	h := &harness{t: t, signer: signer}
 	h.ts = httptest.NewUnstartedServer(nil)
 	issuer := "http://" + h.ts.Listener.Addr().String()
 	h.ts.Config.Handler = New(Options{
@@ -88,7 +98,7 @@ func newHarness(t *testing.T) *harness {
 			RedirectURIs: []string{storesRedirectURI}, PostLogoutRedirectURIs: []string{storesLogoutURI},
 		}},
 		Users:         store,
-		Avatars:       h.avatars,
+		Avatars:       avatars,
 		Signer:        signer,
 		SessionSecret: []byte(strings.Repeat("s", 32)),
 	})

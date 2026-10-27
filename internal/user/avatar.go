@@ -2,8 +2,8 @@ package user
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"sync"
 	"time"
@@ -12,37 +12,61 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// ErrNoAvatar is returned when the user has not registered a profile image.
-var ErrNoAvatar = errors.New("user has no avatar")
+// ErrNoAvatar is returned when no avatar matches the lookup.
+var ErrNoAvatar = errors.New("avatar not found")
 
 // Avatar is a profile image stored by the identity server itself.
 type Avatar struct {
+	UserID int64
+	// Email is the user's email at upload time. An avatar is only shown
+	// while it still matches the current "User".email, so a row left behind
+	// for a deleted user is never attached to a new user who reuses the id.
+	Email string
+	// ID is random and changes on every upload. It is the only handle on
+	// the image (<ISSUER>/avatars/<ID>), so avatars cannot be enumerated.
+	ID          string
 	ContentType string
 	Data        []byte
-	// ETag identifies the image bytes. It is also the ?v= value of the
-	// picture URL, so a new image gets a new URL.
-	ETag      string
-	UpdatedAt time.Time
+	UpdatedAt   time.Time
 }
 
-// AvatarETag derives the version tag from the image bytes.
-func AvatarETag(data []byte) string {
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:16])
+// BelongsTo reports whether the avatar may be shown for u.
+func (a Avatar) BelongsTo(u User) bool {
+	return a.UserID == u.ID && a.Email == u.Email
 }
 
-// AvatarStore keeps profile images in a table owned by the identity server
-// (idp.user_avatar), never in the "User" table, which belongs to
+// avatarIDLen is the length of a 128-bit id in unpadded base64url.
+const avatarIDLen = 22
+
+// NewAvatarID returns a random 128-bit id in unpadded base64url.
+func NewAvatarID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		panic(err) // crypto/rand never fails on supported platforms
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+// ValidAvatarID reports whether id has the shape NewAvatarID produces.
+func ValidAvatarID(id string) bool {
+	if len(id) != avatarIDLen {
+		return false
+	}
+	b, err := base64.RawURLEncoding.Strict().DecodeString(id)
+	return err == nil && len(b) == 16
+}
+
+// AvatarStore keeps profile images in the identity server's own schema
+// (idp.user_avatar). It never touches the "User" table, which belongs to
 // candy-rain-store.
 type AvatarStore interface {
-	// Get returns the image, or ErrNoAvatar.
-	Get(ctx context.Context, userID int64) (Avatar, error)
-	// ETag returns only the version tag, or ErrNoAvatar. It is used to build
-	// the picture claim without loading the bytes.
-	ETag(ctx context.Context, userID int64) (string, error)
-	// Put stores or replaces the image.
-	Put(ctx context.Context, userID int64, contentType string, data []byte) (Avatar, error)
-	// Delete removes the image. Deleting a missing image is not an error.
+	// ForUser returns the avatar of a user without its bytes, or ErrNoAvatar.
+	ForUser(ctx context.Context, userID int64) (Avatar, error)
+	// ByID returns the avatar with its bytes, or ErrNoAvatar.
+	ByID(ctx context.Context, id string) (Avatar, error)
+	// Put stores or replaces the user's image under a new random id.
+	Put(ctx context.Context, userID int64, email, contentType string, data []byte) (Avatar, error)
+	// Delete removes the user's image. Deleting a missing image is not an error.
 	Delete(ctx context.Context, userID int64) error
 }
 
@@ -57,35 +81,38 @@ func NewPostgresAvatarStore(pool *pgxpool.Pool) *PostgresAvatarStore {
 	return &PostgresAvatarStore{pool: pool}
 }
 
-func (s *PostgresAvatarStore) Get(ctx context.Context, userID int64) (Avatar, error) {
-	var a Avatar
+func (s *PostgresAvatarStore) ForUser(ctx context.Context, userID int64) (Avatar, error) {
+	a := Avatar{UserID: userID}
 	err := s.pool.QueryRow(ctx,
-		`SELECT content_type, data, etag, updated_at FROM idp.user_avatar WHERE user_id = $1`, userID,
-	).Scan(&a.ContentType, &a.Data, &a.ETag, &a.UpdatedAt)
+		`SELECT email, avatar_id, content_type, updated_at FROM idp.user_avatar WHERE user_id = $1`, userID,
+	).Scan(&a.Email, &a.ID, &a.ContentType, &a.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Avatar{}, ErrNoAvatar
 	}
 	return a, err
 }
 
-func (s *PostgresAvatarStore) ETag(ctx context.Context, userID int64) (string, error) {
-	var etag string
-	err := s.pool.QueryRow(ctx, `SELECT etag FROM idp.user_avatar WHERE user_id = $1`, userID).Scan(&etag)
+func (s *PostgresAvatarStore) ByID(ctx context.Context, id string) (Avatar, error) {
+	a := Avatar{ID: id}
+	err := s.pool.QueryRow(ctx,
+		`SELECT user_id, email, content_type, data, updated_at FROM idp.user_avatar WHERE avatar_id = $1`, id,
+	).Scan(&a.UserID, &a.Email, &a.ContentType, &a.Data, &a.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return "", ErrNoAvatar
+		return Avatar{}, ErrNoAvatar
 	}
-	return etag, err
+	return a, err
 }
 
-func (s *PostgresAvatarStore) Put(ctx context.Context, userID int64, contentType string, data []byte) (Avatar, error) {
-	a := Avatar{ContentType: contentType, Data: data, ETag: AvatarETag(data)}
+func (s *PostgresAvatarStore) Put(ctx context.Context, userID int64, email, contentType string, data []byte) (Avatar, error) {
+	a := Avatar{UserID: userID, Email: email, ID: NewAvatarID(), ContentType: contentType, Data: data}
 	err := s.pool.QueryRow(ctx, `
-		INSERT INTO idp.user_avatar (user_id, content_type, data, etag, updated_at)
-		VALUES ($1, $2, $3, $4, now())
+		INSERT INTO idp.user_avatar (user_id, email, avatar_id, content_type, data, updated_at)
+		VALUES ($1, $2, $3, $4, $5, now())
 		ON CONFLICT (user_id) DO UPDATE
-		SET content_type = EXCLUDED.content_type, data = EXCLUDED.data, etag = EXCLUDED.etag, updated_at = now()
+		SET email = EXCLUDED.email, avatar_id = EXCLUDED.avatar_id, content_type = EXCLUDED.content_type,
+		    data = EXCLUDED.data, updated_at = now()
 		RETURNING updated_at`,
-		userID, a.ContentType, a.Data, a.ETag,
+		a.UserID, a.Email, a.ID, a.ContentType, a.Data,
 	).Scan(&a.UpdatedAt)
 	return a, err
 }
@@ -107,27 +134,36 @@ func NewMemoryAvatarStore() *MemoryAvatarStore {
 	return &MemoryAvatarStore{avatars: map[int64]Avatar{}, Now: time.Now}
 }
 
-func (m *MemoryAvatarStore) Get(_ context.Context, userID int64) (Avatar, error) {
+func (m *MemoryAvatarStore) ForUser(_ context.Context, userID int64) (Avatar, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	a, ok := m.avatars[userID]
 	if !ok {
 		return Avatar{}, ErrNoAvatar
 	}
-	a.Data = append([]byte(nil), a.Data...)
+	a.Data = nil
 	return a, nil
 }
 
-func (m *MemoryAvatarStore) ETag(ctx context.Context, userID int64) (string, error) {
-	a, err := m.Get(ctx, userID)
-	return a.ETag, err
+func (m *MemoryAvatarStore) ByID(_ context.Context, id string) (Avatar, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, a := range m.avatars {
+		if a.ID == id {
+			a.Data = append([]byte(nil), a.Data...)
+			return a, nil
+		}
+	}
+	return Avatar{}, ErrNoAvatar
 }
 
-func (m *MemoryAvatarStore) Put(_ context.Context, userID int64, contentType string, data []byte) (Avatar, error) {
+func (m *MemoryAvatarStore) Put(_ context.Context, userID int64, email, contentType string, data []byte) (Avatar, error) {
 	a := Avatar{
+		UserID:      userID,
+		Email:       email,
+		ID:          NewAvatarID(),
 		ContentType: contentType,
 		Data:        append([]byte(nil), data...),
-		ETag:        AvatarETag(data),
 		UpdatedAt:   m.Now().UTC().Truncate(time.Second),
 	}
 	m.mu.Lock()

@@ -8,35 +8,42 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
-	"net/url"
-	"strconv"
 
 	"github.com/Sparklingstadt/candy-rain-identity-server/internal/user"
 )
 
 const (
-	// maxAvatarBytes caps the image itself.
+	// maxAvatarBytes caps the uploaded file.
 	maxAvatarBytes = 1 << 20
 	// maxAvatarBody caps the whole multipart request: the image plus room
 	// for the boundaries, headers and the CSRF field.
 	maxAvatarBody = maxAvatarBytes + 64<<10
+	// maxAvatarDrain is how much of a too-large upload is read and thrown
+	// away so the browser can show the error page.
+	maxAvatarDrain = 16 << 20
 
-	avatarCache          = "public, max-age=300"
-	avatarCacheImmutable = "public, max-age=31536000, immutable"
+	// The avatar id changes whenever the image does, so a URL never needs
+	// revalidating.
+	avatarCache = "public, max-age=31536000, immutable"
+	// Even if a browser were tricked into rendering an avatar as a document,
+	// it could not run anything.
+	avatarCSP = "default-src 'none'; sandbox"
 
 	// The account page shows the avatar from this origin and only submits
 	// forms back to it.
 	accountCSP = "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
 
-	msgAvatarType     = "画像は PNG・JPEG・WebP のいずれかにしてください"
-	msgAvatarSize     = "画像は 1MB 以下にしてください"
-	msgAvatarMissing  = "画像を選択してください"
-	msgAvatarOneFile  = "画像は 1 枚だけ選択してください"
+	// accountCSRFName is the double-submit cookie of the standalone
+	// (/account) login form. It is separate from crs_csrf so that opening
+	// /account never replaces the token of a client's login form that is
+	// open in another tab. Path=/ lets GET /account read and reuse it.
+	accountCSRFName = "crs_account_csrf"
+
 	msgAccountExpired = "画面の有効期限が切れました。アカウント画面を開き直してください。"
 )
 
 // accountNotices maps the done parameter to a fixed message, so nothing from
-// the URL is ever shown on the page.
+// the URL is ever shown on the page. Errors use avatarErrorMessages.
 var accountNotices = map[string]string{
 	"updated": "プロフィール画像を更新しました",
 	"deleted": "プロフィール画像を削除しました",
@@ -44,54 +51,72 @@ var accountNotices = map[string]string{
 
 // ---- picture claim and /avatars ----
 
+// userAvatar returns the user's avatar when it still belongs to them: the
+// email saved at upload must match the current one. ok is false when there
+// is none; err is set only when the lookup failed.
+func (s *Server) userAvatar(ctx context.Context, u user.User) (a user.Avatar, ok bool, err error) {
+	a, err = s.opts.Avatars.ForUser(ctx, u.ID)
+	if errors.Is(err, user.ErrNoAvatar) {
+		return user.Avatar{}, false, nil
+	}
+	if err != nil {
+		return user.Avatar{}, false, err
+	}
+	return a, a.BelongsTo(u), nil
+}
+
 // pictureURL returns the picture claim, or "" when the user has no avatar.
 // A lookup failure (for example before the migration is applied) only
 // omits the claim, so it never breaks sign-in.
 func (s *Server) pictureURL(ctx context.Context, u user.User) string {
-	etag, err := s.opts.Avatars.ETag(ctx, u.ID)
+	a, ok, err := s.userAvatar(ctx, u)
 	if err != nil {
-		if !errors.Is(err, user.ErrNoAvatar) {
-			s.opts.Logger.Warn("avatar lookup failed", "sub", u.Subject(), "err", err)
-		}
+		s.opts.Logger.Error("avatar lookup failed; picture claim omitted", "sub", u.Subject(), "err", err)
 		return ""
 	}
-	return avatarPath(u, etag, s.opts.Issuer)
-}
-
-// avatarPath is the versioned image URL under prefix (the issuer, or ""
-// for a same-origin path).
-func avatarPath(u user.User, etag, prefix string) string {
-	return prefix + "/avatars/" + u.Subject() + "?v=" + url.QueryEscape(etag)
+	if !ok {
+		return ""
+	}
+	return s.opts.Issuer + "/avatars/" + a.ID
 }
 
 func (s *Server) handleAvatar(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.ParseInt(r.PathValue("sub"), 10, 64)
-	if err != nil || id <= 0 {
+	id := r.PathValue("id")
+	if !user.ValidAvatarID(id) {
 		avatarNotFound(w)
 		return
 	}
-	a, err := s.opts.Avatars.Get(r.Context(), id)
+	a, err := s.opts.Avatars.ByID(r.Context(), id)
 	if errors.Is(err, user.ErrNoAvatar) {
 		avatarNotFound(w)
 		return
 	}
 	if err != nil {
-		s.opts.Logger.Error("avatar read failed", "sub", id, "err", err)
+		s.opts.Logger.Error("avatar read failed", "err", err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+	// Serve only while the row still belongs to the current user with that
+	// id (there is no foreign key to "User").
+	u, err := s.opts.Users.FindByID(r.Context(), a.UserID)
+	if errors.Is(err, user.ErrNotFound) || (err == nil && !a.BelongsTo(u)) {
+		avatarNotFound(w)
+		return
+	}
+	if err != nil {
+		s.opts.Logger.Error("avatar owner lookup failed", "err", err)
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
 	h := w.Header()
 	h.Set("Content-Type", a.ContentType)
 	h.Set("X-Content-Type-Options", "nosniff")
-	h.Set("ETag", `"`+a.ETag+`"`)
+	h.Set("Content-Security-Policy", avatarCSP)
+	h.Set("Content-Disposition", "inline")
+	h.Set("ETag", `"`+a.ID+`"`)
+	h.Set("Cache-Control", avatarCache)
 	// Client apps on other origins show the image with <img>.
 	h.Set("Cross-Origin-Resource-Policy", "cross-origin")
-	if r.URL.Query().Get("v") == a.ETag {
-		// The picture claim's URL changes whenever the image does.
-		h.Set("Cache-Control", avatarCacheImmutable)
-	} else {
-		h.Set("Cache-Control", avatarCache)
-	}
 	// ServeContent answers If-None-Match with 304 and handles HEAD.
 	http.ServeContent(w, r, "", a.UpdatedAt, bytes.NewReader(a.Data))
 }
@@ -99,21 +124,6 @@ func (s *Server) handleAvatar(w http.ResponseWriter, r *http.Request) {
 func avatarNotFound(w http.ResponseWriter) {
 	w.Header().Set("Cache-Control", "no-cache")
 	http.Error(w, "not found", http.StatusNotFound)
-}
-
-// detectAvatarType judges the image by its magic bytes, never by the file
-// name or the Content-Type the browser sent. It returns "" for anything else
-// (SVG and HTML in particular, which could carry scripts).
-func detectAvatarType(b []byte) string {
-	switch {
-	case bytes.HasPrefix(b, []byte("\x89PNG\r\n\x1a\n")):
-		return "image/png"
-	case bytes.HasPrefix(b, []byte("\xff\xd8\xff")):
-		return "image/jpeg"
-	case len(b) >= 12 && string(b[:4]) == "RIFF" && string(b[8:12]) == "WEBP":
-		return "image/webp"
-	}
-	return ""
 }
 
 // ---- account page ----
@@ -166,32 +176,34 @@ func (s *Server) handleAccount(w http.ResponseWriter, r *http.Request) {
 		s.renderLogin(w, r, http.StatusOK, loginForm{Account: true}, "", "")
 		return
 	}
-	s.renderAccount(w, r, http.StatusOK, u, accountNotices[r.URL.Query().Get("done")], "")
-}
-
-func (s *Server) renderAccount(w http.ResponseWriter, r *http.Request, status int, u user.User, notice, errMsg string) {
-	etag, err := s.opts.Avatars.ETag(r.Context(), u.ID)
-	if err != nil && !errors.Is(err, user.ErrNoAvatar) {
+	a, hasAvatar, err := s.userAvatar(r.Context(), u)
+	if err != nil {
 		s.opts.Logger.Error("avatar lookup failed", "sub", u.Subject(), "err", err)
 		s.renderError(w, http.StatusInternalServerError, "アカウント情報を読み込めませんでした。時間をおいてもう一度お試しください。")
 		return
 	}
 	avatar := ""
-	if err == nil {
-		avatar = avatarPath(u, etag, "")
+	if hasAvatar {
+		avatar = "/avatars/" + a.ID
 	}
+	q := r.URL.Query()
 	h := w.Header()
 	h.Set("Cache-Control", "no-store")
 	h.Set("Content-Security-Policy", accountCSP)
-	s.render(w, status, "account.html", map[string]any{
-		"Name":    u.DisplayName(),
-		"Email":   u.Email,
-		"Avatar":  avatar,
-		"CSRF":    s.accountCSRF(r),
-		"Notice":  notice,
-		"Error":   errMsg,
-		"MaxSize": maxAvatarBytes,
+	s.render(w, http.StatusOK, "account.html", map[string]any{
+		"Name":   u.DisplayName(),
+		"Email":  u.Email,
+		"Avatar": avatar,
+		"CSRF":   s.accountCSRF(r),
+		"Notice": accountNotices[q.Get("done")],
+		"Error":  avatarErrorMessages[q.Get("error")],
 	})
+}
+
+// Every outcome of the account forms is a 303 back to /account (with a
+// fixed code), so no response to a POST ever renders the page or its token.
+func redirectAccountError(w http.ResponseWriter, r *http.Request, code avatarError) {
+	http.Redirect(w, r, "/account?error="+string(code), http.StatusSeeOther)
 }
 
 func (s *Server) handleAvatarUpload(w http.ResponseWriter, r *http.Request) {
@@ -206,7 +218,8 @@ func (s *Server) handleAvatarUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	r.Body = http.MaxBytesReader(w, r.Body, maxAvatarBody)
+	body := r.Body
+	r.Body = http.MaxBytesReader(w, body, maxAvatarBody)
 	// Everything fits in memory, so no temporary files are written.
 	err = r.ParseMultipartForm(maxAvatarBody)
 	if r.MultipartForm != nil {
@@ -215,8 +228,12 @@ func (s *Server) handleAvatarUpload(w http.ResponseWriter, r *http.Request) {
 	var tooLarge *http.MaxBytesError
 	switch {
 	case errors.As(err, &tooLarge) || errors.Is(err, multipart.ErrMessageTooLarge):
-		// Nothing changes, so the CSRF token is not needed to say so.
-		s.renderAccount(w, r, http.StatusRequestEntityTooLarge, u, "", msgAvatarSize)
+		// The CSRF field may be unread, but nothing changes and nothing but
+		// a fixed code is returned. Reading on (up to a cap) lets the browser
+		// finish sending, so it shows the message instead of a connection
+		// reset; the connection is closed afterwards either way.
+		io.CopyN(io.Discard, body, maxAvatarDrain)
+		redirectAccountError(w, r, errAvatarSize)
 		return
 	case err != nil:
 		s.renderError(w, http.StatusBadRequest, "送信内容を読み取れませんでした。")
@@ -227,49 +244,48 @@ func (s *Server) handleAvatarUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, status, msg := readAvatar(r.MultipartForm.File["avatar"])
-	if msg != "" {
-		s.renderAccount(w, r, status, u, "", msg)
+	data, code := readAvatar(r.MultipartForm.File["avatar"])
+	if code != "" {
+		redirectAccountError(w, r, code)
 		return
 	}
-	contentType := detectAvatarType(data)
-	if contentType == "" {
-		s.renderAccount(w, r, http.StatusBadRequest, u, "", msgAvatarType)
+	out, contentType, code := processAvatar(data)
+	if code != "" {
+		redirectAccountError(w, r, code)
 		return
 	}
-	if _, err := s.opts.Avatars.Put(r.Context(), u.ID, contentType, data); err != nil {
+	if _, err := s.opts.Avatars.Put(r.Context(), u.ID, u.Email, contentType, out); err != nil {
 		s.opts.Logger.Error("avatar write failed", "sub", u.Subject(), "err", err)
 		s.renderError(w, http.StatusInternalServerError, "プロフィール画像を保存できませんでした。時間をおいてもう一度お試しください。")
 		return
 	}
-	s.opts.Logger.Info("avatar updated", "sub", u.Subject(), "type", contentType, "bytes", len(data))
+	s.opts.Logger.Info("avatar updated", "sub", u.Subject(), "type", contentType, "bytes", len(out))
 	http.Redirect(w, r, "/account?done=updated", http.StatusSeeOther)
 }
 
-// readAvatar reads the single uploaded file. On failure it returns the
-// status and the message to show.
-func readAvatar(files []*multipart.FileHeader) ([]byte, int, string) {
+// readAvatar reads the single uploaded file.
+func readAvatar(files []*multipart.FileHeader) ([]byte, avatarError) {
 	switch {
 	case len(files) == 0:
-		return nil, http.StatusBadRequest, msgAvatarMissing
+		return nil, errAvatarMissing
 	case len(files) > 1:
-		return nil, http.StatusBadRequest, msgAvatarOneFile
+		return nil, errAvatarMultiple
 	case files[0].Size > maxAvatarBytes:
-		return nil, http.StatusRequestEntityTooLarge, msgAvatarSize
+		return nil, errAvatarSize
 	}
 	f, err := files[0].Open()
 	if err != nil {
-		return nil, http.StatusBadRequest, msgAvatarMissing
+		return nil, errAvatarMissing
 	}
 	defer f.Close()
 	data, err := io.ReadAll(io.LimitReader(f, maxAvatarBytes+1))
 	switch {
 	case err != nil || len(data) == 0:
-		return nil, http.StatusBadRequest, msgAvatarMissing
+		return nil, errAvatarMissing
 	case len(data) > maxAvatarBytes:
-		return nil, http.StatusRequestEntityTooLarge, msgAvatarSize
+		return nil, errAvatarSize
 	}
-	return data, http.StatusOK, ""
+	return data, ""
 }
 
 func (s *Server) handleAvatarDelete(w http.ResponseWriter, r *http.Request) {

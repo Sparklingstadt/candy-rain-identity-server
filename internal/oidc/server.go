@@ -94,7 +94,7 @@ func New(opts Options) *Server {
 	mux.HandleFunc("GET /userinfo", s.handleUserinfo)
 	mux.HandleFunc("POST /userinfo", s.handleUserinfo)
 	mux.HandleFunc("GET /logout", s.handleLogout)
-	mux.HandleFunc("GET /avatars/{sub}", s.handleAvatar)
+	mux.HandleFunc("GET /avatars/{id}", s.handleAvatar)
 	mux.HandleFunc("GET /account", s.handleAccount)
 	mux.HandleFunc("POST /account/avatar", s.handleAvatarUpload)
 	mux.HandleFunc("POST /account/avatar/delete", s.handleAvatarDelete)
@@ -229,6 +229,17 @@ type loginForm struct {
 	Account bool
 }
 
+// csrfCookie names the double-submit cookie of the form and its path. The
+// account form has its own cookie, so that opening /account never replaces
+// the token of a client's login form open in another tab (crs_csrf is
+// scoped to /authorize and so cannot be read, and reused, on /account).
+func (f loginForm) csrfCookie() (name, path string) {
+	if f.Account {
+		return accountCSRFName, "/"
+	}
+	return csrfName, "/authorize"
+}
+
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
 	if err := r.ParseForm(); err != nil {
@@ -245,7 +256,8 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	cookie, err := r.Cookie(csrfName)
+	csrfCookie, _ := form.csrfCookie()
+	cookie, err := r.Cookie(csrfCookie)
 	if err != nil || subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(r.PostForm.Get("csrf_token"))) != 1 {
 		msg := "画面の有効期限が切れました。ストアからもう一度サインインしてください。"
 		if form.Account {
@@ -556,11 +568,12 @@ func (s *Server) cookie(name, value, path string, maxAge int) *http.Cookie {
 }
 
 func (s *Server) renderLogin(w http.ResponseWriter, r *http.Request, status int, form loginForm, email, errMsg string) {
+	name, path := form.csrfCookie()
 	csrf := randomToken()
-	if c, err := r.Cookie(csrfName); err == nil && len(c.Value) >= 32 {
+	if c, err := r.Cookie(name); err == nil && len(c.Value) >= 32 {
 		csrf = c.Value
 	}
-	http.SetCookie(w, s.cookie(csrfName, csrf, "/authorize", 3600))
+	http.SetCookie(w, s.cookie(name, csrf, path, 3600))
 	w.Header().Set("Cache-Control", "no-store")
 	s.render(w, status, "login.html", map[string]any{
 		"Request":   form.Request,
