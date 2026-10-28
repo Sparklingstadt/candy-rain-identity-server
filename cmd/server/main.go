@@ -41,6 +41,10 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	defer pool.Close()
+	// Which database this instance uses, without the password, so the
+	// target of migrations can be told from the logs alone.
+	cc := pool.Config().ConnConfig
+	logger.Info("database", "host", cc.Host, "port", cc.Port, "database", cc.Database, "user", cc.User)
 
 	users := user.NewPostgresStore(pool)
 	warnIfOverprivileged(ctx, logger, users)

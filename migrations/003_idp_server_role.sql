@@ -12,6 +12,27 @@
 -- その後、ID サーバーの DATABASE_URL のユーザーを idp_server に替える
 -- （Supabase の接続プーラー経由なら、ユーザー名は idp_server.<プロジェクト ref>）。
 
+-- 何かを作る前に、接続先とパスワードを確かめる。別の DB（"User" に passwordHash が
+-- ない開発用 DB など）や、空のパスワードで途中まで適用されるのを防ぐ。
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'User' AND column_name = 'passwordHash'
+  ) THEN
+    RAISE EXCEPTION 'public."User"."passwordHash" がありません。candy-rain-store の DB（ID サーバーの DATABASE_URL と同じ DB）に接続しているか確認してください（current_user=%, database=%）', current_user, current_database();
+  END IF;
+  IF to_regclass('idp.user_avatar') IS NULL OR to_regclass('idp.login_failure') IS NULL THEN
+    RAISE EXCEPTION '先に 001_user_avatar.sql と 002_login_failure.sql を適用してください';
+  END IF;
+END
+$$;
+
+SELECT :'idp_server_password' = '' AS idp_server_password_empty \gset
+\if :idp_server_password_empty
+DO $$ BEGIN RAISE EXCEPTION 'idp_server_password が空です。-v idp_server_password=... で渡してください'; END $$;
+\endif
+
 SELECT NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'idp_server') AS create_idp_server \gset
 \if :create_idp_server
 CREATE ROLE idp_server LOGIN NOINHERIT PASSWORD :'idp_server_password';
