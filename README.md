@@ -102,6 +102,8 @@ psql "$OWNER_DATABASE_URL" -v ON_ERROR_STOP=1 -v idp_server_password="$IDP_SERVE
   -f migrations/003_idp_server_role.sql
 ```
 
+適用先は、ID サーバーの起動ログ `"msg":"database"` に出る host・database と同じ DB にしてください（`DATABASE_URL` は秘密値として保存すると後から読めないため）。003 は、`"User"."passwordHash"` がない DB や、001・002 が未適用の DB、パスワードが空のときは、何も作らずに止まります。
+
 003 のあと、ID サーバーの `DATABASE_URL` のユーザーとパスワードを `idp_server` のものに替えます（Supabase の接続プーラー経由なら、ユーザー名は `idp_server.<プロジェクト ref>`）。003 を再実行すると `idp_server` のパスワードを更新します。今後 `idp` にテーブルを足すときは、003 末尾のポリシーの一覧にも足してください。
 
 以下は 001（プロフィール画像）についての補足です。`idp` スキーマと `idp.user_avatar` は起動時には作成しません。デプロイ前に [migrations/001_user_avatar.sql](migrations/001_user_avatar.sql) を `DATABASE_URL` と同じデータベースに適用してください（`IF NOT EXISTS` なので、二度実行しても壊れません）。開発中の古い版（外部キー付きや `etag` 列のもの）を適用済みのデータベースでは、マイグレーションがエラーで止まります。その場合は `DROP TABLE idp.user_avatar;`（と、あれば `DROP TABLE public.idp_user_avatar;`）を実行してから適用し直してください。
